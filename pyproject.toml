@@ -1,0 +1,17 @@
+[project]
+name = "p8"
+version = "0.1.0"
+description = "MLOps - Part2"
+readme = "README.md"
+authors = [
+    { name = "L. Jacquinot", email = "315764128+lenny-ai-data@users.noreply.github.com" }
+]
+requires-python = ">=3.13"
+dependencies = []
+
+[tool.uv]
+package = false
+
+[tool.pytest.ini_options]
+pythonpath = ["."]
+testpaths = ["tests"]
