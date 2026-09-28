@@ -10,7 +10,9 @@ import shutil
 from pathlib import Path
 
 import mlflow
+import pandas as pd
 from mlflow import MlflowClient
+from sklearn.model_selection import train_test_split
 
 # --- CONSTANTES ----------------------------------
 # Registry de P6
@@ -21,6 +23,13 @@ ALIAS = "champion"
 # Destination dans le dépôt
 DOSSIER_MODELE = Path("model")
 FICHIER_METADONNEES = DOSSIER_MODELE / "metadonnees.json"
+FICHIER_BORNES = DOSSIER_MODELE / "bornes.json"
+
+# Jeu d'entraînement de P6 : même split que le notebook de modélisation (test_size, seed, stratification)
+DATASET = Path("../P6/data/processed/dataset.parquet")
+TARGET = "TARGET"
+TEST_SIZE = 0.2
+SEED = 42
 
 # Fichiers exportés inutiles pour P8 : environnement complet de P6 (les dépendances
 # de P8 sont dans pyproject.toml) et méta du registry (reprises dans metadonnees.json)
@@ -52,6 +61,15 @@ def exporter_modele() -> dict:
     FICHIER_METADONNEES.write_text(json.dumps(metadonnees, indent=2, ensure_ascii=False), encoding="utf-8")
     return metadonnees
 
+def exporter_bornes() -> dict:
+    """Écrit le min et le max de chaque variable sur le jeu d'entraînement (référence des valeurs plausibles)."""
+    tab = pd.read_parquet(DATASET)
+    X_train, _ = train_test_split(tab.drop(columns=TARGET), test_size=TEST_SIZE, random_state=SEED, stratify=tab[TARGET])
+    bornes = {nom: [float(mini), float(maxi)] for nom, (mini, maxi) in X_train.agg(["min", "max"]).T.iterrows()}
+    FICHIER_BORNES.write_text(json.dumps(bornes), encoding="utf-8")
+    return {"clients": len(X_train), "variables": len(bornes)}
+
 # --- MAIN ----------------------------------
 if __name__ == "__main__":
     print(exporter_modele())
+    print(exporter_bornes())

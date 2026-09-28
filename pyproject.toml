@@ -14,6 +14,9 @@ dependencies = [
     "lightgbm==4.7.0",
     "skops==0.14.0",
     "pandas==2.3.3",
+    # API
+    "fastapi>=0.141.1",
+    "uvicorn>=0.54.0",
 ]
 
 [tool.uv]
