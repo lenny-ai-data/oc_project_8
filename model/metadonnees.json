@@ -1,0 +1,14 @@
+{
+  "nom": "scoring-credit",
+  "alias": "champion",
+  "version": 2,
+  "run_id": "86e23ef7a34c49d4888ad84bdf03e19a",
+  "seuil": 0.09,
+  "tags": {
+    "seuil": "0.090",
+    "ratio_cout_fn_fp": "10",
+    "cout_metier_test": "0.481",
+    "auc_test": "0.790",
+    "entrainement": "246008 clients"
+  }
+}
