@@ -38,7 +38,6 @@ jobs:
   # ==================== TESTS ====================
   tests:
     name: Tests et couverture
-    needs: qualite
     runs-on: ubuntu-24.04
     steps:
       - uses: actions/checkout@v7
@@ -68,7 +67,6 @@ jobs:
   # ==================== IMAGE ====================
   image:
     name: Image Docker
-    needs: tests
     runs-on: ubuntu-24.04
     steps:
       - uses: actions/checkout@v7
