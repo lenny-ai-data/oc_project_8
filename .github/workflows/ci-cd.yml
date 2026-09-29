@@ -1,0 +1,141 @@
+# CI/CD de l'API de scoring : lint, tests, build de l'image, puis déploiement sur Render.
+# Déclenché à chaque push sur main.
+
+name: CI/CD
+
+# Le projet n'utilise pas de PR : on verifie chaque push
+on:
+  push:
+  workflow_dispatch:
+
+# Un nouveau push annule le run précédent
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+permissions:
+  contents: read
+
+# 1 job = 1 VM dédiée
+jobs:
+
+  # ==================== QUALITÉ ====================
+  qualite:
+    name: Lint (ruff)
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v7
+      - uses: astral-sh/setup-uv@v10.0.1
+        with:
+          enable-cache: true
+
+      - name: Installer l'environnement
+        run: uv sync --frozen
+
+      - name: Lint
+        run: uv run ruff check .
+
+  # ==================== TESTS ====================
+  tests:
+    name: Tests et couverture
+    needs: qualite
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v7
+      - uses: astral-sh/setup-uv@v10.0.1
+        with:
+          enable-cache: true
+
+      - name: Installer l'environnement
+        run: uv sync --frozen
+
+      # Le modèle est dans le dépôt (model/) : ni réseau ni secret.
+      # 90% de couverture minimum.
+      - name: Tests et couverture
+        run: |
+          uv run pytest \
+            --cov-report=html:tests/htmlcov \
+            --cov-fail-under=90
+
+      # Rapport en artefact
+      - name: Publier le rapport de couverture
+        if: always()
+        uses: actions/upload-artifact@v7
+        with:
+          name: couverture
+          path: tests/htmlcov/
+
+  # ==================== IMAGE ====================
+  image:
+    name: Image Docker
+    needs: tests
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v7
+
+      # Contexte réduit par .dockerignore
+      - name: Construire l'image
+        run: docker build -t scoring-api:${{ github.sha }} .
+
+  # ==================== DÉPLOIEMENT ====================
+  # Render reconstruit l'image depuis GitHub
+  deploiement:
+    name: Déploiement (Render)
+    needs: [qualite, tests, image]
+    if: github.ref == 'refs/heads/main'
+    runs-on: ubuntu-24.04
+    timeout-minutes: 20
+
+    env:
+      SERVICE: ${{ vars.URL_SERVICE }}
+
+    steps:
+      # Aucun checkout : rien du dépôt n'est utilisé ici
+      - name: Vérifier la configuration
+        env:
+          CROCHET: ${{ secrets.RENDER_DEPLOY_HOOK }}
+        run: |
+          if [ -z "$SERVICE" ]; then
+            echo "::error::variable de dépôt URL_SERVICE absente (attendu : https://<service>.onrender.com)"
+            exit 1
+          fi
+          if [ -z "$CROCHET" ]; then
+            echo "::error::secret RENDER_DEPLOY_HOOK absent"
+            exit 1
+          fi
+          echo "Service cible : $SERVICE"
+
+      # Le crochet porte déjà sa clé en paramètre, d'où le `&` : `ref` désigne le commit à déployer
+      - name: Déclencher le déploiement
+        env:
+          CROCHET: ${{ secrets.RENDER_DEPLOY_HOOK }}
+        run: |
+          code=$(curl -sS -X POST -o corps.json -w '%{http_code}' "$CROCHET&ref=$GITHUB_SHA")
+          cat corps.json; echo
+          # 202 : déploiement en cours, il prendra ce commit
+          case "$code" in
+            200|201|202) echo "Déploiement demandé (HTTP $code)" ;;
+            *) echo "::error::le crochet a répondu HTTP $code"; exit 1 ;;
+          esac
+
+      # Render sert l'ancienne version pendant qu'il construit la nouvelle.
+      # /health porte la révision déployée (RENDER_GIT_COMMIT) : on attend la bonne.
+      # Il répond 503 tant que le modèle n'est pas chargé.
+      - name: Vérifier le service déployé
+        run: |
+          echo "Attente de la révision $GITHUB_SHA sur $SERVICE"
+          for tentative in $(seq 1 60); do
+            reponse=$(curl -sS --max-time 20 "$SERVICE/health" || true)
+            revision=$(echo "$reponse" | jq -r '.revision // ""' 2>/dev/null || true)
+
+            # Comparaison sur 7 caractères : Render peut exposer un SHA court
+            if [ -n "$revision" ] && [ "${revision:0:7}" = "${GITHUB_SHA:0:7}" ]; then
+              echo "Révision en ligne après $((tentative * 15))s : $reponse"
+              exit 0
+            fi
+
+            echo "  tentative $tentative : en ligne = ${revision:-aucune réponse valide}"
+            sleep 15
+          done
+          echo "::error::révision $GITHUB_SHA absente après 15 min : déploiement trop long, ou RENDER_GIT_COMMIT non exposé par l'hébergeur"
+          exit 1
