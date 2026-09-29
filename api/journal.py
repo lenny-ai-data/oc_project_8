@@ -66,6 +66,18 @@ def creer_table(moteur: Engine) -> None:
     """Crée la table `predictions` si elle n'existe pas encore."""
     TABLE.metadata.create_all(moteur)
 
+def preparer() -> Engine | None:
+    """Moteur prêt à écrire, appelé au démarrage de l'API. Un journal indisponible est signalé dans
+    les logs sans empêcher le démarrage. Base injoignable : chaque écriture retentera sa chance.
+    Pas de moteur (ex. dossier SQLite impossible à créer) : les appels ne sont pas journalisés."""
+    moteur = None
+    try:
+        moteur = creer_moteur()
+        creer_table(moteur)
+    except Exception:  # noqa: BLE001 - le journal ne doit jamais faire échouer l'API
+        journal.exception("Journal des appels indisponible")
+    return moteur
+
 def enregistrer(moteur: Engine, ligne: dict) -> None:
     """Ajoute un appel au journal. Une panne de la base est tracée dans les logs
     mais n'empeche pas le client d'avoir sa réponse."""

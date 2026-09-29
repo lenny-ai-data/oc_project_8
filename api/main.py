@@ -8,15 +8,20 @@ Usage : uv run uvicorn api.main:app --reload   (documentation interactive sur /d
 import json
 import math
 import os
+import time
 from contextlib import asynccontextmanager
-from datetime import datetime
+from datetime import UTC, datetime
 from pathlib import Path
 from typing import Annotated
 
 import mlflow
 import pandas as pd
-from fastapi import Body, FastAPI, HTTPException
+from fastapi import Body, FastAPI, HTTPException, Request, Response
 from pydantic import BaseModel, Field, StrictFloat
+from starlette.background import BackgroundTask
+from starlette.concurrency import run_in_threadpool
+
+from api import journal
 
 # --- CONSTANTES ----------------------------------
 
@@ -37,6 +42,7 @@ obligatoires: list[str] = []
 bornes: dict[str, list[float]] = {}
 metadonnees: dict = {}
 erreur_demarrage: str | None = None
+moteur = None
 charge_le: datetime | None = None
 duree_chargement: float | None = None
 
@@ -128,13 +134,36 @@ def charger_exemples() -> dict:
         for numero, ligne in enumerate(exemples["data"], start=1)
     }
 
+def entrees_renseignees(corps: bytes) -> dict | None:
+    """Variables renseignées d'une requête (ni nulles ni NaN), ou None si le corps n'est pas exploitable."""
+    try:
+        features = json.loads(corps)["features"]
+    except (ValueError, KeyError, TypeError):
+        return None
+    if not isinstance(features, dict):
+        return None
+    return {nom: valeur for nom, valeur in features.items()
+            if valeur is not None and not (isinstance(valeur, float) and math.isnan(valeur))}
+
+def ligne_journal(horodatage: datetime, debut: float, corps: bytes, statut: int) -> dict:
+    """Champs communs à toutes les lignes du journal ; latence mesurée à l'appel de cette fonction."""
+    return {
+        "horodatage": horodatage,
+        "statut_http": statut,
+        "entrees": entrees_renseignees(corps),
+        "latence_ms": (time.perf_counter() - debut) * 1000,
+        "version_modele": metadonnees.get("version"),
+        "revision": REVISION,
+    }
+
 @asynccontextmanager
 async def lifespan(app: FastAPI):
-    """Charge le modèle, ses métadonnées et les bornes au démarrage.
+    """Charge le modèle, ses métadonnées et les bornes au démarrage, et prépare le journal des appels.
 
     Un modèle absent ne fait pas échouer le démarrage : les routes répondent 503 avec la cause
     """
-    global modele, colonnes, obligatoires, bornes, metadonnees, en_ligne_depuis, erreur_demarrage
+    global modele, colonnes, obligatoires, bornes, metadonnees, en_ligne_depuis, erreur_demarrage, moteur
+    moteur = journal.preparer()
     try:
         modele = mlflow.pyfunc.load_model(str(DOSSIER_MODELE))
         schema = modele.metadata.get_input_schema()
@@ -157,6 +186,37 @@ app = FastAPI(
     version="1.0.0",
     lifespan=lifespan,
 )
+
+@app.middleware("http")
+async def journaliser(request: Request, call_next):
+    """Journalise chaque appel à /predict (succès comme erreurs) : mesure la latence, puis écrit la
+    ligne en tâche de fond, une fois la réponse partie."""
+    if request.url.path != "/predict" or moteur is None:
+        return await call_next(request)
+    horodatage = datetime.now(UTC)
+    debut = time.perf_counter()
+    corps = await request.body()
+    try:
+        reponse = await call_next(request)
+    except Exception as exception:
+        # Panne imprévue : le client aura une erreur 500, sans réponse où accrocher la tâche de fond.
+        # On écrit donc tout de suite (hors de la boucle d'événements), puis on relance l'exception.
+        ligne = ligne_journal(horodatage, debut, corps, 500)
+        ligne["erreur"] = f"{type(exception).__name__} : {exception}"
+        await run_in_threadpool(journal.enregistrer, moteur, ligne)
+        raise
+
+    ligne = ligne_journal(horodatage, debut, corps, reponse.status_code)
+    if reponse.status_code == 200:
+        # Score, décision et temps d'inférence déposés par la route
+        ligne |= request.state.trace
+    else:
+        # Cause de l'erreur : lue dans la réponse, qui est ensuite reconstruite à l'identique
+        contenu = b"".join([morceau async for morceau in reponse.body_iterator])
+        ligne["erreur"] = json.loads(contenu).get("detail")
+        reponse = Response(contenu, status_code=reponse.status_code, headers=dict(reponse.headers))
+    reponse.background = BackgroundTask(journal.enregistrer, moteur, ligne)
+    return reponse
 
 @app.get("/health", summary="État de l'API")
 def health() -> Health:
@@ -196,7 +256,7 @@ def metadata() -> Metadata:
         503: {"description": "Modèle indisponible"},
     },
 )
-def predict(client: Annotated[Client, Body(openapi_examples=EXEMPLES)]) -> Score:
+def predict(client: Annotated[Client, Body(openapi_examples=EXEMPLES)], request: Request) -> Score:
     """Calcule la probabilité de défaut du client et la compare au seuil métier.
 
     Les 147 variables obligatoires doivent être renseignées, les 380 autres, si absentes ou nulles, sont traitées comme manquantes par le modèle.
@@ -206,12 +266,17 @@ def predict(client: Annotated[Client, Body(openapi_examples=EXEMPLES)]) -> Score
     verif_client(client.features)
     # Colonnes dans l'ordre du modèle, variables non fournies à NaN
     X = pd.DataFrame([client.features]).reindex(columns=colonnes).astype(float)
+    debut = time.perf_counter()
     score = float(modele.predict(X)[0, 1])
+    temps_inference_ms = (time.perf_counter() - debut) * 1000
     seuil = metadonnees["seuil"]
+    decision = "NOK" if score >= seuil else "OK"
+    # Repris par le middleware pour le journal
+    request.state.trace = {"score": score, "decision": decision, "temps_inference_ms": temps_inference_ms}
     return Score(
         score=round(score,3),
         seuil=round(seuil,3),
-        decision="NOK" if score >= seuil else "OK",
+        decision=decision,
         nom_modele=metadonnees["nom"],
         alias=metadonnees["alias"],
         version_modele=metadonnees["version"],
