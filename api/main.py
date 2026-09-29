@@ -8,6 +8,7 @@ Usage : uv run uvicorn api.main:app --reload   (documentation interactive sur /d
 import json
 import math
 import os
+import secrets
 import time
 from contextlib import asynccontextmanager
 from datetime import UTC, datetime
@@ -16,7 +17,8 @@ from typing import Annotated
 
 import mlflow
 import pandas as pd
-from fastapi import Body, FastAPI, HTTPException, Request, Response
+from fastapi import Body, Depends, FastAPI, HTTPException, Request, Response
+from fastapi.security import HTTPAuthorizationCredentials, HTTPBearer
 from pydantic import BaseModel, Field, StrictFloat
 from starlette.background import BackgroundTask
 from starlette.concurrency import run_in_threadpool
@@ -25,14 +27,17 @@ from api import journal
 
 # --- CONSTANTES ----------------------------------
 
-# Modèle champion de P6 (voir scripts/exporter_modele.py)
+# Modèle de production (voir scripts/exporter_modele.py)
 DOSSIER_MODELE = Path("model")
 FICHIER_METADONNEES = DOSSIER_MODELE / "metadonnees.json"
 FICHIER_BORNES = DOSSIER_MODELE / "bornes.json"
 FICHIER_EXEMPLES = DOSSIER_MODELE / "input_example.json"
 
-# Commit déployé, injecté par Render ; absent en local
+# Commit déployé, injecté par Render (absent en local)
 REVISION = os.getenv("RENDER_GIT_COMMIT")
+
+# Jeton d'accès à /predict
+JETON = os.getenv("API_TOKEN")
 
 # --- INITIALISATION ----------------------------------
 
@@ -43,6 +48,7 @@ bornes: dict[str, list[float]] = {}
 metadonnees: dict = {}
 erreur_demarrage: str | None = None
 moteur = None
+securite = HTTPBearer(auto_error=False, description="Jeton d'accès à l'API (variable API_TOKEN)")
 charge_le: datetime | None = None
 duree_chargement: float | None = None
 
@@ -98,6 +104,21 @@ def verif_modele() -> None:
     """Erreur 503 si le modèle n'a pas pu être chargé au démarrage."""
     if modele is None:
         raise HTTPException(503, f"Modèle indisponible : {erreur_demarrage}")
+
+def jeton_correct(identifiants: HTTPAuthorizationCredentials | None) -> bool:
+    """Vrai si le jeton reçu (en-tête `Authorization: Bearer`) est celui de l'API."""
+    # compare_digest : comparaison en temps constant
+    return bool(JETON) and identifiants is not None and secrets.compare_digest(identifiants.credentials.encode(), JETON.encode())
+
+def verif_jeton(identifiants: Annotated[HTTPAuthorizationCredentials | None, Depends(securite)]) -> None:
+    """Erreur 401 si le jeton reçu n'est pas celui de l'API.
+
+    Erreur 503 si l'API n'a pas de jeton configuré : la route reste fermée plutôt qu'ouverte à tous.
+    """
+    if not JETON:
+        raise HTTPException(503, "Jeton d'accès non configuré sur l'API")
+    if not jeton_correct(identifiants):
+        raise HTTPException(401, "Jeton d'accès absent ou invalide", headers={"WWW-Authenticate": "Bearer"})
 
 def verif_client(features: dict[str, float | None]) -> None:
     """Erreur 422 si la requête ne peut pas être scorée : variables obligatoires manquantes,
@@ -189,9 +210,10 @@ app = FastAPI(
 
 @app.middleware("http")
 async def journaliser(request: Request, call_next):
-    """Journalise chaque appel à /predict (succès comme erreurs) : mesure la latence, puis écrit la
-    ligne en tâche de fond, une fois la réponse partie."""
-    if request.url.path != "/predict" or moteur is None:
+    """Journalise chaque appel authentifié à /predict (succès comme erreurs) : mesure la latence, puis
+    écrit la ligne en tâche de fond, une fois la réponse partie."""
+    # Appels sans jeton valide ignorés : n'importe qui pourrait sinon écrire dans le journal
+    if request.url.path != "/predict" or moteur is None or not jeton_correct(await securite(request)):
         return await call_next(request)
     horodatage = datetime.now(UTC)
     debut = time.perf_counter()
@@ -251,9 +273,11 @@ def metadata() -> Metadata:
 @app.post(
     "/predict",
     summary="Scorer un client",
+    dependencies=[Depends(verif_jeton)],
     responses={
+        401: {"description": "Jeton d'accès absent ou invalide"},
         422: {"description": "Requête invalide : variables obligatoires manquantes, noms inconnus, valeurs hors des bornes d'entraînement ou types incorrects"},
-        503: {"description": "Modèle indisponible"},
+        503: {"description": "Modèle indisponible, ou jeton d'accès non configuré sur l'API"},
     },
 )
 def predict(client: Annotated[Client, Body(openapi_examples=EXEMPLES)], request: Request) -> Score:
