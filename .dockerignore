@@ -1,0 +1,9 @@
+# Le contexte de build ne contient que ce que le Dockerfile copie
+*
+!pyproject.toml
+!uv.lock
+!api/
+!model/
+
+# Caches locaux de python
+**/__pycache__
