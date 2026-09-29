@@ -37,3 +37,8 @@ dev = [
     "pytest-cov>=7.1.0",
     "ruff>=0.16.9",
 ]
+monitoring = [
+    "evidently>=0.7.23",
+    "ipykernel>=7.3.0",
+    "matplotlib>=3.11.2",
+]
