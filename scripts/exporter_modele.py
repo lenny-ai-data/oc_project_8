@@ -1,4 +1,5 @@
-"""Exporte le modèle champion du registry de P6 dans le dépôt (dossier `model/`).
+"""Exporte le modèle champion du registry de P6 dans le dépôt (dossier `model/`)
+et exporte les résultats complets pour 10,000 échantillons pour servir de référence au monitoring.
 
 A lancer depuis la racine de P8, avec l'environnement de P6 qui contient MLflow et le registry :
     uv run --project ../P6 python scripts/exporter_modele.py
@@ -24,6 +25,10 @@ ALIAS = "champion"
 DOSSIER_MODELE = Path("model")
 FICHIER_METADONNEES = DOSSIER_MODELE / "metadonnees.json"
 FICHIER_BORNES = DOSSIER_MODELE / "bornes.json"
+
+# Référence du monitoring : échantillon d'entraînement et son score.
+FICHIER_REFERENCE = Path("monitoring/reference.parquet")
+TAILLE_REFERENCE = 10000
 
 # Jeu d'entraînement de P6 : même split que le notebook de modélisation (test_size, seed, stratification)
 DATASET = Path("../P6/data/processed/dataset.parquet")
@@ -61,15 +66,32 @@ def exporter_modele() -> dict:
     FICHIER_METADONNEES.write_text(json.dumps(metadonnees, indent=2, ensure_ascii=False), encoding="utf-8")
     return metadonnees
 
+def decouper_dataset() -> tuple[pd.DataFrame, pd.DataFrame]:
+    """Variables des jeux d'entraînement et de test de P6 (même split que le notebook de modélisation)."""
+    tab = pd.read_parquet(DATASET)
+    return train_test_split(tab.drop(columns=TARGET), test_size=TEST_SIZE, random_state=SEED, stratify=tab[TARGET])
+
 def exporter_bornes() -> dict:
     """Écrit le min et le max de chaque variable sur le jeu d'entraînement (référence des valeurs plausibles)."""
-    tab = pd.read_parquet(DATASET)
-    X_train, _ = train_test_split(tab.drop(columns=TARGET), test_size=TEST_SIZE, random_state=SEED, stratify=tab[TARGET])
+    X_train, _ = decouper_dataset()
     bornes = {nom: [float(mini), float(maxi)] for nom, (mini, maxi) in X_train.agg(["min", "max"]).T.iterrows()}
     FICHIER_BORNES.write_text(json.dumps(bornes), encoding="utf-8")
     return {"clients": len(X_train), "variables": len(bornes)}
+
+def exporter_reference() -> dict:
+    """Écrit la référence du monitoring : un échantillon du jeu d'entraînement, toutes variables, avec le score
+    du modèle exporté (colonne `score`)."""
+    X_train, _ = decouper_dataset()
+    reference = X_train.sample(TAILLE_REFERENCE, random_state=SEED).reset_index(drop=True)
+    modele = mlflow.pyfunc.load_model(str(DOSSIER_MODELE))
+    colonnes = modele.metadata.get_input_schema().input_names()
+    reference["score"] = modele.predict(reference.reindex(columns=colonnes).astype(float))[:, 1]
+    FICHIER_REFERENCE.parent.mkdir(parents=True, exist_ok=True)
+    reference.to_parquet(FICHIER_REFERENCE)
+    return {"clients": len(reference), "colonnes": reference.shape[1], "score_moyen": round(float(reference["score"].mean()), 4)}
 
 # --- MAIN ----------------------------------
 if __name__ == "__main__":
     print(exporter_modele())
     print(exporter_bornes())
+    print(exporter_reference())
