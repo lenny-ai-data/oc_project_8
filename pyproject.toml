@@ -7,7 +7,17 @@ authors = [
     { name = "L. Jacquinot", email = "315764128+lenny-ai-data@users.noreply.github.com" }
 ]
 requires-python = ">=3.13"
-dependencies = []
+dependencies = [
+    # Modele : versions de P6 figees pour recharger model.skops a l'identique
+    "mlflow-skinny==3.15.2",
+    "scikit-learn==1.9.0",
+    "lightgbm==4.7.0",
+    "skops==0.14.0",
+    "pandas==2.3.3",
+    # API
+    "fastapi>=0.141.1",
+    "uvicorn>=0.54.0",
+]
 
 [tool.uv]
 package = false
@@ -15,3 +25,12 @@ package = false
 [tool.pytest.ini_options]
 pythonpath = ["."]
 testpaths = ["tests"]
+addopts = "--cov=api --cov-report=term-missing"
+
+[dependency-groups]
+dev = [
+    "httpx2>=2.13.1",
+    "pytest>=9.1.1",
+    "pytest-cov>=7.1.0",
+    "ruff>=0.16.9",
+]
