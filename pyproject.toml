@@ -17,6 +17,9 @@ dependencies = [
     # API
     "fastapi>=0.141.1",
     "uvicorn>=0.54.0",
+    # Journal des appels (Postgres en production, SQLite en local)
+    "sqlalchemy>=2.1.1",
+    "psycopg[binary]>=3.3.6",
 ]
 
 [tool.uv]

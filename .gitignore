@@ -19,3 +19,7 @@ CONSIGNE.md
 # Rapports de couverture des tests
 .coverage
 tests/htmlcov/
+
+# Journal local (SQLite) et donnees de monitoring
+data/
+*.db
