@@ -86,6 +86,13 @@ def entrees_a_plat(lignes: pd.DataFrame) -> pd.DataFrame:
     entrees["score"] = reussis["score"]
     return entrees
 
+def cause_erreur(erreur) -> str:
+    """Cause d'une erreur du journal : catégories de l'API (422 métier, dict), type incorrect (422 Pydantic,
+    liste) ou erreur serveur (500 et 503, message texte)."""
+    if isinstance(erreur, dict):
+        return " + ".join(sorted(erreur))
+    return "type incorrect" if isinstance(erreur, list) else "erreur serveur"
+
 # --- FONCTIONS DE MONITORING ----------------------------------
 
 def importance_variables() -> pd.Series:
