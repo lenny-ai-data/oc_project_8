@@ -36,6 +36,8 @@ ECART_REFUS_MAX = 0.05
 PURPLE = "#C9BCE3"
 GOLD_DARK = "#FFE186"
 GRIS = "#929292"
+ROUGE = "#D1495B"
+COULEURS_NIVEAU = {"stable": PURPLE, "vigilance": GOLD_DARK, "critique": ROUGE}
 
 # --- FONCTIONS ----------------------------------
 
@@ -69,6 +71,31 @@ def densites(groupes: dict[str, pd.Series], bornes: np.ndarray) -> pd.DataFrame:
         for nom, serie in groupes.items()
     ])
 
+def graphe_distributions(histogrammes: pd.DataFrame, titre_x: str, seuil: float | None = None) -> alt.LayerChart | alt.Chart:
+    """Densités de la référence et de la fenêtre courante en marches, avec un seuil vertical facultatif."""
+    courbes = alt.Chart(histogrammes).mark_line(interpolate="step").encode(
+        x=alt.X("valeur:Q", title=titre_x),
+        y=alt.Y("densite:Q", title="Densité"),
+        color=alt.Color("groupe:N", title=None, scale=alt.Scale(domain=["Référence", "Fenêtre courante"], range=[GRIS, GOLD_DARK])),
+    )
+    if seuil is None:
+        return courbes
+    return courbes + alt.Chart(pd.DataFrame({"valeur": [seuil]})).mark_rule(color=GRIS, strokeDash=[4, 4]).encode(x="valeur:Q")
+
+def valeurs(donnees: pd.DataFrame, colonne: str) -> pd.Series:
+    """Valeurs renseignées d'une colonne, l'âge en années remplaçant DAYS_BIRTH (jours avant la demande, négatifs)."""
+    serie = donnees[colonne].dropna()
+    return -serie / 365.25 if colonne == "DAYS_BIRTH" else serie
+
+def persistance(psi_courant: pd.Series, psi_precedent: pd.Series | None) -> pd.Series:
+    """Persistance de chaque colonne en dérive : confirmée si la fenêtre précédente dépassait aussi le seuil,
+    à confirmer sinon, non évaluable sans fenêtre précédente complète. Vide pour une colonne stable."""
+    if psi_precedent is None:
+        statut = pd.Series("non évaluable", index=psi_courant.index)
+    else:
+        statut = (psi_precedent >= analyse.SEUIL_PSI).map({True: "confirmée", False: "à confirmer"})
+    return statut.where(psi_courant >= analyse.SEUIL_PSI, "")
+
 # --- MAIN ----------------------------------
 
 st.set_page_config(page_title="Monitoring du scoring crédit", layout="wide")
@@ -92,23 +119,35 @@ with st.sidebar:
     st.caption(f"Base : {'Supabase (Postgres)' if os.getenv('DATABASE_URL') else 'SQLite locale'}")
     st.caption(f"Dernier appel : {lignes['horodatage'].max():%d/%m/%Y %H:%M} UTC")
 
-# Fenêtre courante : les derniers appels réussis, et tous les appels reçus depuis son début
-fenetre = entrees.tail(taille)
+# Fenêtres disjointes d'appels réussis : la dernière est la fenêtre courante. On garde aussi tous les appels
+# reçus depuis son début (erreurs comprises)
+fenetres = analyse.fenetres_disjointes(entrees, taille)
+fenetre = fenetres[-1]
 appels_fenetre = lignes[lignes["horodatage"] >= lignes.loc[fenetre.index[0], "horodatage"]]
 
 st.title("Monitoring du scoring crédit")
 st.caption(f"Fenêtre courante : {len(fenetre)} derniers appels réussis, depuis le "
            f"{appels_fenetre['horodatage'].min():%d/%m/%Y %H:%M} UTC. Référence : {len(reference):,} clients d'entraînement.".replace(",", " "))
 
+# PSI de chaque fenêtre face à la référence : une colonne par fenêtre, datée par son dernier appel
+historique = pd.DataFrame({lignes.loc[f.index[-1], "horodatage"]: analyse.psi_colonnes(f, reference, colonnes) for f in fenetres})
+psi_courant = historique.iloc[:, -1]
+# La fenêtre précédente ne sert à confirmer une alerte que si elle est complète
+psi_precedent = historique.iloc[:, -2] if len(fenetres) > 1 and len(fenetres[-2]) == taille else None
+niveaux = psi_courant.map(analyse.niveau_psi)
+statuts = persistance(psi_courant, psi_precedent)
+
 # Indicateurs clés de la fenêtre courante
 refus_fenetre = (fenetre["score"] >= seuil).mean()
 refus_reference = (reference["score"] >= seuil).mean()
-kpi = st.columns(4)
+kpi = st.columns(5)
 kpi[0].metric("Appels journalisés", f"{len(lignes):,}".replace(",", " "))
 kpi[1].metric("Taux d'erreur", f"{(appels_fenetre['statut_http'] != 200).mean():.1%}")
 kpi[2].metric("Latence p95", f"{appels_fenetre['latence_ms'].quantile(0.95):.0f} ms")
 kpi[3].metric("Taux de refus", f"{refus_fenetre:.1%}", f"{(refus_fenetre - refus_reference) * 100:+.1f} pts vs référence",
               delta_color="inverse")
+kpi[4].metric("Colonnes en dérive", f"{(niveaux != 'stable').sum()} / {len(colonnes)}",
+              f"{(statuts == 'confirmée').sum()} confirmée(s)", delta_color="off", delta_arrow="off")
 
 onglet_suivi, onglet_drift = st.tabs(["Suivi opérationnel", "Dérive des données"])
 
@@ -158,14 +197,66 @@ with onglet_suivi:
     # Histogrammes en densité, scores écrêtés à 0,6 pour la lisibilité, et seuil de décision
     histogrammes = densites({"Référence": reference["score"].clip(upper=0.6), "Fenêtre courante": fenetre["score"].clip(upper=0.6)},
                             np.linspace(0, 0.6, 61))
-    courbes = alt.Chart(histogrammes).mark_line(interpolate="step").encode(
-        x=alt.X("valeur:Q", title="Score (probabilité de défaut)"),
-        y=alt.Y("densite:Q", title="Densité"),
-        color=alt.Color("groupe:N", title=None, scale=alt.Scale(domain=["Référence", "Fenêtre courante"], range=[GRIS, GOLD_DARK])),
-    )
-    ligne_seuil = alt.Chart(pd.DataFrame({"valeur": [seuil]})).mark_rule(color=GRIS, strokeDash=[4, 4]).encode(x="valeur:Q")
-    droite.altair_chart(courbes + ligne_seuil, width="stretch")
+    droite.altair_chart(graphe_distributions(histogrammes, "Score (probabilité de défaut)", seuil), width="stretch")
     droite.caption(f"Ligne pointillée : seuil de décision ({seuil}), refus au-dessus.")
 
 with onglet_drift:
-    st.info("En construction : PSI des variables surveillées.")
+    # --- Fiabilité de la fenêtre : sous 1 000 appels, le bruit du PSI dépasse le seuil (étude du notebook)
+    if len(fenetre) < taille:
+        st.warning(f"Fenêtre incomplète : {len(fenetre)} appels réussis sur {taille}.")
+    if len(fenetre) < FENETRE_DEFAUT:
+        st.caption(f"Sous {FENETRE_DEFAUT} appels, le PSI est bruité : fausses alertes fréquentes (un tiers des fenêtres à 500 appels).")
+
+    # --- Synthèse des alertes
+    critiques, vigilances = list(niveaux.index[niveaux == "critique"]), list(niveaux.index[niveaux == "vigilance"])
+    if critiques:
+        st.error(f"Dérive critique (PSI ≥ {analyse.SEUIL_PSI_CRITIQUE}) : {', '.join(critiques)}")
+    if vigilances:
+        st.warning(f"Dérive à surveiller (PSI ≥ {analyse.SEUIL_PSI}) : {', '.join(vigilances)}")
+    if not critiques and not vigilances:
+        st.success(f"Aucune colonne en dérive : PSI maximal {psi_courant.max():.3f}.")
+
+    # --- PSI de la fenêtre courante : barres colorées par niveau, seuils en pointillés
+    st.subheader("PSI de la fenêtre courante")
+    gauche, droite = st.columns([3, 2])
+    tableau = pd.DataFrame({"psi": psi_courant, "niveau": niveaux, "persistance": statuts}).rename_axis("colonne").reset_index()
+    barres = alt.Chart(tableau).mark_bar().encode(
+        x=alt.X("psi:Q", title="PSI"),
+        y=alt.Y("colonne:N", sort="-x", title=None),
+        color=alt.Color("niveau:N", title="Niveau",
+                        scale=alt.Scale(domain=list(COULEURS_NIVEAU), range=list(COULEURS_NIVEAU.values()))),
+        tooltip=["colonne", alt.Tooltip("psi:Q", format=".3f"), "niveau", "persistance"],
+    )
+    lignes_seuil = alt.Chart(pd.DataFrame({"psi": [analyse.SEUIL_PSI, analyse.SEUIL_PSI_CRITIQUE]})).mark_rule(
+        color=GRIS, strokeDash=[4, 4]).encode(x="psi:Q")
+    gauche.altair_chart(barres + lignes_seuil, width="stretch")
+    # Détail des colonnes en dérive : la fenêtre précédente confirme ou non l'alerte
+    en_derive = tableau[tableau["niveau"] != "stable"].set_index("colonne").sort_values("psi", ascending=False)
+    if not en_derive.empty:
+        en_derive["psi précédent"] = psi_precedent[en_derive.index] if psi_precedent is not None else np.nan
+        en_derive["renseignées"] = fenetre[en_derive.index].notna().mean()
+        droite.dataframe(en_derive[["psi", "psi précédent", "niveau", "persistance", "renseignées"]],
+                         column_config={"psi": st.column_config.NumberColumn("PSI", format="%.3f"),
+                                        "psi précédent": st.column_config.NumberColumn("PSI précédent", format="%.3f"),
+                                        "renseignées": st.column_config.NumberColumn("Renseignées", format="percent")})
+    droite.caption(f"Vigilance à partir de {analyse.SEUIL_PSI}, critique à partir de {analyse.SEUIL_PSI_CRITIQUE}. "
+                   "Une alerte est confirmée quand la fenêtre précédente (disjointe et complète) dépassait aussi le seuil. "
+                   "Les colonnes peu renseignées sont les plus bruitées.")
+
+    # --- Historique : PSI des fenêtres disjointes successives
+    st.subheader("Historique par fenêtre")
+    if len(fenetres) < 2:
+        st.info("Une seule fenêtre : pas encore d'historique.")
+    else:
+        choix = st.multiselect("Colonnes", colonnes, default=list(en_derive.index) or list(psi_courant.nlargest(3).index))
+        st.line_chart(historique.loc[choix].T, x_label="Fin de la fenêtre (UTC)", y_label="PSI")
+        st.caption(f"{len(fenetres)} fenêtres de {taille} appels réussis ; la plus ancienne compte {len(fenetres[0])} appels.")
+
+    # --- Distribution d'une colonne : référence face à la fenêtre courante
+    st.subheader("Distribution d'une colonne")
+    colonne = st.selectbox("Colonne", colonnes, index=colonnes.index(psi_courant.idxmax()))
+    bornes = np.histogram_bin_edges(valeurs(reference, colonne), bins=30)
+    histogrammes = densites({"Référence": valeurs(reference, colonne), "Fenêtre courante": valeurs(fenetre, colonne)}, bornes)
+    st.altair_chart(graphe_distributions(histogrammes, "Âge (années)" if colonne == "DAYS_BIRTH" else colonne), width="stretch")
+    st.caption(f"PSI {psi_courant[colonne]:.3f}, valeurs renseignées : {fenetre[colonne].notna().mean():.0%} "
+               f"de la fenêtre contre {reference[colonne].notna().mean():.0%} de la référence.")

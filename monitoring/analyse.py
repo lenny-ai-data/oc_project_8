@@ -36,6 +36,9 @@ MARGE_HORLOGE_S = 10
 SEUIL_PSI = 0.1
 DRIFT_SHARE = 0.5
 
+# Alerte du tableau de bord : vigilance à partir de SEUIL_PSI, critique à partir de 0,25 (convention du scoring de crédit)
+SEUIL_PSI_CRITIQUE = 0.25
+
 # --- FONCTIONS SUPPORT ----------------------------------
 
 def charger_env() -> None:
@@ -136,6 +139,18 @@ def psi(reference: pd.Series, actuel: pd.Series) -> float:
 def psi_colonnes(actuel: pd.DataFrame, reference: pd.DataFrame, colonnes: list[str]) -> pd.Series:
     """PSI de chaque colonne de `actuel` par rapport à `reference`."""
     return pd.Series({colonne: psi(reference[colonne], actuel[colonne]) for colonne in colonnes})
+
+def fenetres_disjointes(entrees: pd.DataFrame, taille: int) -> list[pd.DataFrame]:
+    """Appels découpés en fenêtres successives de `taille`, en partant du plus récent, de la plus ancienne à la plus
+    récente : la dernière est la fenêtre courante, la première peut être incomplète."""
+    debuts = range(len(entrees) - taille, -taille, -taille)
+    return [entrees.iloc[max(debut, 0):debut + taille] for debut in reversed(debuts)]
+
+def niveau_psi(valeur: float) -> str:
+    """Niveau d'alerte d'un PSI : stable (< 0,1), vigilance (0,1 à 0,25) ou critique (>= 0,25)."""
+    if valeur >= SEUIL_PSI_CRITIQUE:
+        return "critique"
+    return "vigilance" if valeur >= SEUIL_PSI else "stable"
 
 def verdict_global(rapport) -> dict:
     """Nombre et part de colonnes en dérive, et verdict sur le jeu de données (part >= DRIFT_SHARE)."""
