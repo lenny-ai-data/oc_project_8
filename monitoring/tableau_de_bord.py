@@ -117,23 +117,28 @@ with st.sidebar:
         charger_journal.clear()
         st.rerun()
     st.caption(f"Base : {'Supabase (Postgres)' if os.getenv('DATABASE_URL') else 'SQLite locale'}")
+    st.caption(f"Appels journalisés : {len(lignes):,}".replace(",", " "))
     st.caption(f"Dernier appel : {lignes['horodatage'].max():%d/%m/%Y %H:%M} UTC")
 
-# Fenêtres disjointes d'appels réussis : la dernière est la fenêtre courante. On garde aussi tous les appels
-# reçus depuis son début (erreurs comprises)
+# Fenêtres disjointes d'appels réussis : la dernière est la fenêtre courante. 
+# On identifie aussi tous les appels reçus depuis son début (erreurs comprises)
 fenetres = analyse.fenetres_disjointes(entrees, taille)
+# La plus ancienne fenêtre, souvent incomplète, a un PSI trop bruité : on l'écarte s'il en reste d'autres
+if len(fenetres) > 1 and len(fenetres[0]) < taille:
+    fenetres = fenetres[1:]
 fenetre = fenetres[-1]
 appels_fenetre = lignes[lignes["horodatage"] >= lignes.loc[fenetre.index[0], "horodatage"]]
+reussis = appels_fenetre[appels_fenetre["statut_http"] == 200]
 
 st.title("Monitoring du scoring crédit")
 st.caption(f"Fenêtre courante : {len(fenetre)} derniers appels réussis, depuis le "
-           f"{appels_fenetre['horodatage'].min():%d/%m/%Y %H:%M} UTC. Référence : {len(reference):,} clients d'entraînement.".replace(",", " "))
+           f"{appels_fenetre['horodatage'].min():%d/%m/%Y %H:%M} UTC. Référence : {len(reference):,} clients d'entraînement.")
 
 # PSI de chaque fenêtre face à la référence : une colonne par fenêtre, datée par son dernier appel
 historique = pd.DataFrame({lignes.loc[f.index[-1], "horodatage"]: analyse.psi_colonnes(f, reference, colonnes) for f in fenetres})
 psi_courant = historique.iloc[:, -1]
-# La fenêtre précédente ne sert à confirmer une alerte que si elle est complète
-psi_precedent = historique.iloc[:, -2] if len(fenetres) > 1 and len(fenetres[-2]) == taille else None
+# La fenêtre précédente (complète) confirme ou non une alerte
+psi_precedent = historique.iloc[:, -2] if len(fenetres) > 1 else None
 niveaux = psi_courant.map(analyse.niveau_psi)
 statuts = persistance(psi_courant, psi_precedent)
 
@@ -141,9 +146,9 @@ statuts = persistance(psi_courant, psi_precedent)
 refus_fenetre = (fenetre["score"] >= seuil).mean()
 refus_reference = (reference["score"] >= seuil).mean()
 kpi = st.columns(5)
-kpi[0].metric("Appels journalisés", f"{len(lignes):,}".replace(",", " "))
+kpi[0].metric("Appels dans la fenêtre", f"{len(appels_fenetre):,}".replace(",", " "))
 kpi[1].metric("Taux d'erreur", f"{(appels_fenetre['statut_http'] != 200).mean():.1%}")
-kpi[2].metric("Latence p95", f"{appels_fenetre['latence_ms'].quantile(0.95):.0f} ms")
+kpi[2].metric("Latence p95", f"{reussis['latence_ms'].quantile(0.95):.0f} ms")
 kpi[3].metric("Taux de refus", f"{refus_fenetre:.1%}", f"{(refus_fenetre - refus_reference) * 100:+.1f} pts vs référence",
               delta_color="inverse")
 kpi[4].metric("Colonnes en dérive", f"{(niveaux != 'stable').sum()} / {len(colonnes)}",
@@ -166,7 +171,6 @@ with onglet_suivi:
 
     # --- Temps de réponse : latence de l'API et temps d'inférence du modèle seul, appels réussis
     st.subheader("Temps de réponse")
-    reussis = appels_fenetre[appels_fenetre["statut_http"] == 200]
     gauche, droite = st.columns([1, 3])
     resume = reussis[["latence_ms", "temps_inference_ms"]].quantile([0.5, 0.95, 1]).round(0)
     resume.index = ["Médiane", "95e centile", "Maximum"]
@@ -186,17 +190,16 @@ with onglet_suivi:
     st.subheader("Scores")
     gauche, droite = st.columns([1, 3])
     ecart = refus_fenetre - refus_reference
-    gauche.metric("Taux de refus de la référence", f"{refus_reference:.1%}")
+    gauche.metric("Taux de refus", f"{refus_fenetre:.1%}", f"{(refus_fenetre - refus_reference) * 100:+.1f} pts vs référence", delta_color="inverse")
     gauche.metric("Score moyen", f"{fenetre['score'].mean():.3f}",
                   f"{fenetre['score'].mean() - reference['score'].mean():+.3f} vs référence", delta_color="inverse")
     if abs(ecart) > ECART_REFUS_MAX:
-        gauche.warning(f"Taux de refus à {ecart * 100:+.1f} points de la référence (tolérance {ECART_REFUS_MAX * 100:.0f} points) : "
-                       "la population a changé, voir l'onglet Dérive.")
+        gauche.warning(f"Taux de refus à {ecart * 100:+.1f} points de la référence (tol. {ECART_REFUS_MAX * 100:.0f} points) : la population a changé.")
     else:
         gauche.success(f"Taux de refus dans la tolérance de {ECART_REFUS_MAX * 100:.0f} points autour de la référence.")
-    # Histogrammes en densité, scores écrêtés à 0,6 pour la lisibilité, et seuil de décision
-    histogrammes = densites({"Référence": reference["score"].clip(upper=0.6), "Fenêtre courante": fenetre["score"].clip(upper=0.6)},
-                            np.linspace(0, 0.6, 61))
+    # Histogrammes en densité, scores écrêtés à 0,5 pour la lisibilité, et seuil de décision
+    histogrammes = densites({"Référence": reference["score"].clip(upper=0.5), "Fenêtre courante": fenetre["score"].clip(upper=0.5)},
+                            np.linspace(0, 0.5, 51))
     droite.altair_chart(graphe_distributions(histogrammes, "Score (probabilité de défaut)", seuil), width="stretch")
     droite.caption(f"Ligne pointillée : seuil de décision ({seuil}), refus au-dessus.")
 
@@ -205,7 +208,7 @@ with onglet_drift:
     if len(fenetre) < taille:
         st.warning(f"Fenêtre incomplète : {len(fenetre)} appels réussis sur {taille}.")
     if len(fenetre) < FENETRE_DEFAUT:
-        st.caption(f"Sous {FENETRE_DEFAUT} appels, le PSI est bruité : fausses alertes fréquentes (un tiers des fenêtres à 500 appels).")
+        st.caption(f"Sous {FENETRE_DEFAUT} appels, le PSI est bruité : fausses alertes fréquentes (40 % des fenêtres à 500 appels).")
 
     # --- Synthèse des alertes
     critiques, vigilances = list(niveaux.index[niveaux == "critique"]), list(niveaux.index[niveaux == "vigilance"])
@@ -250,7 +253,7 @@ with onglet_drift:
     else:
         choix = st.multiselect("Colonnes", colonnes, default=list(en_derive.index) or list(psi_courant.nlargest(3).index))
         st.line_chart(historique.loc[choix].T, x_label="Fin de la fenêtre (UTC)", y_label="PSI")
-        st.caption(f"{len(fenetres)} fenêtres de {taille} appels réussis ; la plus ancienne compte {len(fenetres[0])} appels.")
+        st.caption(f"{len(fenetres)} fenêtres complètes de {taille} appels réussis.")
 
     # --- Distribution d'une colonne : référence face à la fenêtre courante
     st.subheader("Distribution d'une colonne")
@@ -260,3 +263,17 @@ with onglet_drift:
     st.altair_chart(graphe_distributions(histogrammes, "Âge (années)" if colonne == "DAYS_BIRTH" else colonne), width="stretch")
     st.caption(f"PSI {psi_courant[colonne]:.3f}, valeurs renseignées : {fenetre[colonne].notna().mean():.0%} "
                f"de la fenêtre contre {reference[colonne].notna().mean():.0%} de la référence.")
+
+    # --- Rapport Evidently de la fenêtre courante : généré seulement au clic (environ 1 s, 5 Mo), sans relancer la page
+    st.subheader("Rapport Evidently")
+    fin_fenetre = lignes.loc[fenetre.index[-1], "horodatage"]
+    st.download_button(
+        "Télécharger le rapport HTML",
+        data=lambda: analyse.rapport_drift(fenetre, reference, colonnes[:-1]).get_html_str(as_iframe=False),
+        file_name=f"rapport_drift_{fin_fenetre:%Y%m%d_%H%M}.html",
+        mime="text/html",
+        on_click="ignore",
+    )
+    st.caption("Rapport complet d'Evidently sur la fenêtre courante (mêmes colonnes et même PSI) : distributions et "
+               "test de chaque colonne. Le verdict global d'Evidently (50 % de colonnes en dérive) est à lire avec "
+               "prudence : une dérive concentrée sur quelques variables ne le déclenche pas.")
