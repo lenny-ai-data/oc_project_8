@@ -17,6 +17,7 @@ from typing import Annotated
 
 import mlflow
 import numpy as np
+import onnxruntime as ort
 from fastapi import Body, Depends, FastAPI, HTTPException, Request, Response
 from fastapi.security import HTTPAuthorizationCredentials, HTTPBearer
 from pydantic import BaseModel, Field, StrictFloat
@@ -33,6 +34,11 @@ FICHIER_METADONNEES = DOSSIER_MODELE / "metadonnees.json"
 FICHIER_BORNES = DOSSIER_MODELE / "bornes.json"
 FICHIER_EXEMPLES = DOSSIER_MODELE / "input_example.json"
 
+# Classifieur converti en ONNX (voir scripts/exporter_onnx.py) : entrée float32, sortie des probabilités
+FICHIER_ONNX = DOSSIER_MODELE / "model.onnx"
+ENTREE_ONNX = "X"
+SORTIE_ONNX = "probabilities"
+
 # Commit déployé, injecté par Render (absent en local)
 REVISION = os.getenv("RENDER_GIT_COMMIT")
 
@@ -42,7 +48,7 @@ JETON = os.getenv("API_TOKEN")
 # --- INITIALISATION ----------------------------------
 
 modele = None
-pipeline = None
+session = None
 colonnes: list[str] = []
 obligatoires: list[str] = []
 bornes: dict[str, list[float]] = {}
@@ -184,19 +190,28 @@ async def lifespan(app: FastAPI):
 
     Un modèle absent ne fait pas échouer le démarrage : les routes répondent 503 avec la cause
     """
-    global modele, pipeline, colonnes, obligatoires, bornes, metadonnees, en_ligne_depuis, erreur_demarrage, moteur
+    global modele, session, colonnes, obligatoires, bornes, metadonnees, en_ligne_depuis, erreur_demarrage, moteur
     moteur = journal.preparer()
     try:
+        # Modèle MLflow : signature (variables, obligatoires) et traçabilité jusqu'au registry de P6
         modele = mlflow.pyfunc.load_model(str(DOSSIER_MODELE))
-        # On appelle directement le pipeline sklearn sous-jacent pour éviter la validation de schéma de MLflow (réalisée via Pydantic)
-        pipeline = modele.get_raw_model()
+        # Inférence par ONNX Runtime, sans la validation de schéma de MLflow (faite via Pydantic et verif_client)
         # Un seul thread pour ne pas surcharger le CPU partagé de Render
-        pipeline[-1].set_params(n_jobs=1)
+        options = ort.SessionOptions()
+        options.intra_op_num_threads = 1
+        session = ort.InferenceSession(FICHIER_ONNX, options, providers=["CPUExecutionProvider"])
         schema = modele.metadata.get_input_schema()
         colonnes = schema.input_names()
         obligatoires = schema.required_input_names()
         bornes = json.loads(FICHIER_BORNES.read_text(encoding="utf-8"))
         metadonnees = json.loads(FICHIER_METADONNEES.read_text(encoding="utf-8"))
+        # model.onnx doit venir du même export que le modèle MLflow (voir scripts/exporter_modele.py)
+        marques = session.get_modelmeta().custom_metadata_map
+        if (marques.get("version"), marques.get("run_id")) != (str(metadonnees["version"]), metadonnees["run_id"]):
+            raise RuntimeError(
+                f"model.onnx désynchronisé du modèle MLflow : version {marques.get('version')}, run {marques.get('run_id')} "
+                f"au lieu de la version {metadonnees['version']}, run {metadonnees['run_id']}"
+            )
         en_ligne_depuis = datetime.now().astimezone()
     except Exception as erreur:  # noqa: BLE001 - toute panne au démarrage doit être signalée
         modele, erreur_demarrage = None, f"{type(erreur).__name__} : {erreur}"
@@ -293,11 +308,11 @@ def predict(client: Annotated[Client, Body(openapi_examples=EXEMPLES)], request:
     """
     verif_modele()
     verif_client(client.features)
-    # Colonnes dans l'ordre du modèle, variables non fournies à NaN
-    X = np.array([[client.features.get(nom) for nom in colonnes]], dtype=float)
+    # Colonnes dans l'ordre du modèle, variables non fournies à NaN, en float32 comme l'entrée du graphe ONNX
+    X = np.array([[client.features.get(nom) for nom in colonnes]], dtype=np.float32)
     debut = time.perf_counter()
-    # Inférence via le pipeline directement
-    score = float(pipeline.predict_proba(X)[0, 1])
+    # Inférence par ONNX Runtime
+    score = float(session.run([SORTIE_ONNX], {ENTREE_ONNX: X})[0][0, 1])
     temps_inference_ms = (time.perf_counter() - debut) * 1000
     seuil = metadonnees["seuil"]
     decision = "NOK" if score >= seuil else "OK"

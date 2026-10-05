@@ -1,8 +1,9 @@
-"""Exporte le modèle champion du registry de P6 dans le dépôt (dossier `model/`)
-et exporte les résultats complets pour 10,000 échantillons pour servir de référence au monitoring.
+"""Exporte le modèle champion du registry de P6 dans le dépôt (dossier `model/`), avec sa conversion ONNX
+servie par l'API, et exporte les résultats complets pour 10,000 échantillons pour servir de référence au monitoring.
 
-A lancer depuis la racine de P8, avec l'environnement de P6 qui contient MLflow et le registry :
-    uv run --project ../P6 python scripts/exporter_modele.py
+A lancer depuis la racine de P8, avec l'environnement de P6 qui contient MLflow et le registry,
+complété à la volée par onnxmltools (conversion ONNX) :
+    uv run --project ../P6 --with onnxmltools python scripts/exporter_modele.py
 """
 
 # --- IMPORT MODULES ----------------------------------
@@ -25,6 +26,10 @@ ALIAS = "champion"
 DOSSIER_MODELE = Path("model")
 FICHIER_METADONNEES = DOSSIER_MODELE / "metadonnees.json"
 FICHIER_BORNES = DOSSIER_MODELE / "bornes.json"
+
+# Classifieur converti en ONNX, servi par l'API : entrée float32 nommée comme dans api/main.py
+FICHIER_ONNX = DOSSIER_MODELE / "model.onnx"
+ENTREE_ONNX = "X"
 
 # Référence du monitoring : échantillon d'entraînement et son score.
 FICHIER_REFERENCE = Path("monitoring/reference.parquet")
@@ -66,6 +71,28 @@ def exporter_modele() -> dict:
     FICHIER_METADONNEES.write_text(json.dumps(metadonnees, indent=2, ensure_ascii=False), encoding="utf-8")
     return metadonnees
 
+def exporter_onnx(metadonnees: dict) -> dict:
+    """Convertit le classifieur LightGBM du modèle exporté en ONNX (`model/model.onnx`), marqué de la version
+    du registry et du run MLflow : l'API refuse de démarrer si ces marques diffèrent de metadonnees.json.
+
+    L'étape de cast float32 du pipeline devient l'entrée float32 du graphe. Les seuils des arbres passent
+    en float32 : écarts de score rares, mesurés par scripts/profiler_api.py.
+    """
+    # Import local : simuler_trafic.py importe ce module dans l'environnement de P6, sans onnxmltools
+    from onnx.helper import set_model_props
+    from onnxmltools import convert_lightgbm
+    from onnxmltools.convert.common.data_types import FloatTensorType
+
+    modele = mlflow.pyfunc.load_model(str(DOSSIER_MODELE))
+    colonnes = modele.metadata.get_input_schema().input_names()
+    # zipmap=False : probabilités en tableau numpy plutôt qu'en liste de dictionnaires
+    graphe = convert_lightgbm(modele.get_raw_model()[-1], initial_types=[(ENTREE_ONNX, FloatTensorType([None, len(colonnes)]))], zipmap=False)
+    # Traçabilité jusqu'au registry de P6
+    graphe.model_version = metadonnees["version"]
+    set_model_props(graphe, {"nom": metadonnees["nom"], "version": str(metadonnees["version"]), "run_id": metadonnees["run_id"]})
+    FICHIER_ONNX.write_bytes(graphe.SerializeToString())
+    return {"fichier": str(FICHIER_ONNX), "taille_mo": round(FICHIER_ONNX.stat().st_size / 1e6, 1), "variables": len(colonnes)}
+
 def decouper_dataset() -> tuple[pd.DataFrame, pd.DataFrame]:
     """Variables des jeux d'entraînement et de test de P6 (même split que le notebook de modélisation)."""
     tab = pd.read_parquet(DATASET)
@@ -92,6 +119,8 @@ def exporter_reference() -> dict:
 
 # --- MAIN ----------------------------------
 if __name__ == "__main__":
-    print(exporter_modele())
+    metadonnees = exporter_modele()
+    print(metadonnees)
+    print(exporter_onnx(metadonnees))
     print(exporter_bornes())
     print(exporter_reference())

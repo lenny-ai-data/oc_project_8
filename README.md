@@ -261,9 +261,11 @@ Deux phases de 4 500 appels (journal du 02/10/2026), comparées à la référenc
 Après avoir promu un nouveau modèle (avec son registry et son jeu de données) :
 
 ```bash
-# Réexporte le modèle, les métadonnées et les bornes dans model/, et la référence du monitoring
-uv run python scripts/exporter_modele.py
+# Réexporte le modèle, sa conversion ONNX, les métadonnées et les bornes dans model/, et la référence du monitoring
+# (environnement de P6 pour le registry, onnxmltools ajouté à la volée pour la conversion)
+uv run --project ../P6 --with onnxmltools python scripts/exporter_modele.py
 ```
+`model/model.onnx` porte la version du registry et le run MLflow du modèle dont il est issu : l'API refuse de démarrer (503) s'ils ne correspondent pas à `metadonnees.json`.
 Les versions de `scikit-learn`, `lightgbm`, `skops` et `pandas` sont figées dans `pyproject.toml` : le format `skops` est lié à la version de scikit-learn.
 
 ## Tests et CI/CD

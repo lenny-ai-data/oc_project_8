@@ -1906,6 +1906,7 @@ dependencies = [
     { name = "fastapi" },
     { name = "lightgbm" },
     { name = "mlflow-skinny" },
+    { name = "onnxruntime" },
     { name = "pandas" },
     { name = "psycopg", extra = ["binary"] },
     { name = "scikit-learn" },
@@ -1929,7 +1930,7 @@ monitoring = [
 ]
 optimisation = [
     { name = "onnxmltools" },
-    { name = "onnxruntime" },
+    { name = "pyarrow" },
     { name = "snakeviz" },
 ]
 
@@ -1938,6 +1939,7 @@ requires-dist = [
     { name = "fastapi", specifier = ">=0.141.1" },
     { name = "lightgbm", specifier = "==4.7.0" },
     { name = "mlflow-skinny", specifier = "==3.15.2" },
+    { name = "onnxruntime", specifier = ">=1.30.0" },
     { name = "pandas", specifier = "==2.3.3" },
     { name = "psycopg", extras = ["binary"], specifier = ">=3.3.6" },
     { name = "scikit-learn", specifier = "==1.9.0" },
@@ -1961,7 +1963,7 @@ monitoring = [
 ]
 optimisation = [
     { name = "onnxmltools", specifier = ">=1.16.0" },
-    { name = "onnxruntime", specifier = ">=1.30.0" },
+    { name = "pyarrow", specifier = ">=25.0.1" },
     { name = "snakeviz", specifier = ">=2.2.2" },
 ]
 

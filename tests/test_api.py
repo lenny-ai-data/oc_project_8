@@ -5,6 +5,8 @@ Usage : uv run pytest   (couverture de api/ affichée)
 
 # --- IMPORT MODULES ----------------------------------
 
+import json
+
 import pandas as pd
 import pytest
 from fastapi.testclient import TestClient
@@ -80,9 +82,10 @@ def test_predict_exemples(api, numero):
     assert corps["decision"] == ("NOK" if corps["score"] >= corps["seuil"] else "OK")
     assert corps["seuil"] == pytest.approx(main.metadonnees["seuil"], abs=1e-3)
     assert corps["version_modele"] == main.metadonnees["version"]
-    # Non-régression de l'optimisation : score non arrondi (journal) identique à celui du modèle MLflow complet
+    # Non-régression de l'optimisation : score non arrondi (journal) égal à celui du modèle MLflow complet,
+    # à la précision du float32 près (seuils des arbres en float32 dans le graphe ONNX)
     X = pd.DataFrame([features]).reindex(columns=main.colonnes).astype(float)
-    assert lignes_journal()[-1]["score"] == main.modele.predict(X)[0, 1]
+    assert lignes_journal()[-1]["score"] == pytest.approx(main.modele.predict(X)[0, 1], abs=1e-6)
 
 def test_jeton_requis(api, monkeypatch):
     avant = len(lignes_journal())
@@ -158,10 +161,10 @@ def test_predict_corps_inexploitable(api):
         assert lignes_journal()[-1]["entrees"] is None
 
 def test_panne_imprevue_journalisee(api, monkeypatch):
-    def modele_casse(_):
+    def modele_casse(*_):
         raise RuntimeError("modèle cassé")
 
-    monkeypatch.setattr(main.pipeline, "predict_proba", modele_casse)
+    monkeypatch.setattr(main.session, "run", modele_casse)
     assert api.post("/predict", json={"features": features_valides()}).status_code == 500
     ligne = lignes_journal()[-1]
     assert ligne["statut_http"] == 500
@@ -200,7 +203,7 @@ def test_modele_indisponible(api, monkeypatch):
 def test_demarrage_sans_fichiers_du_modele_ni_base(tmp_path, monkeypatch):
     # Le démarrage n'échoue pas : l'erreur est gardée et les routes répondent 503
     monkeypatch.setattr(main, "modele", main.modele)
-    monkeypatch.setattr(main, "pipeline", main.pipeline)
+    monkeypatch.setattr(main, "session", main.session)
     monkeypatch.setattr(main, "moteur", main.moteur)
     monkeypatch.setattr(main, "erreur_demarrage", None)
     # Base injoignable (dossier absent) : la création de la table échoue sans bloquer le démarrage
@@ -212,3 +215,15 @@ def test_demarrage_sans_fichiers_du_modele_ni_base(tmp_path, monkeypatch):
     assert main.erreur_demarrage
     # Sans fichier d'exemples, Swagger n'en propose pas
     assert main.charger_exemples() == {}
+
+def test_demarrage_onnx_desynchronise(tmp_path, monkeypatch):
+    # model.onnx marqué version 2, metadonnees.json annonçant une autre version : routes en 503 avec la cause
+    for nom in ("modele", "session", "moteur", "metadonnees", "erreur_demarrage"):
+        monkeypatch.setattr(main, nom, getattr(main, nom))
+    autre_export = tmp_path / "metadonnees.json"
+    autre_export.write_text(json.dumps(main.metadonnees | {"version": 99}), encoding="utf-8")
+    monkeypatch.setattr(main, "FICHIER_METADONNEES", autre_export)
+    with TestClient(main.app) as client:
+        reponse = client.get("/health")
+    assert reponse.status_code == 503
+    assert "désynchronisé" in reponse.json()["detail"]
