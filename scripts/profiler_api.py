@@ -1,8 +1,8 @@
-"""Profile la route /predict de l'API : où passe le temps d'une requête ?
+"""Profile la route /predict de l'API et trace les gains de l'optimisation
 
-Deux mesures, sur le vrai modèle et un client d'exemple de Swagger :
-- cProfile de requêtes complètes (TestClient) : fonctions les plus coûteuses en temps cumulé
-- chronométrage de chaque étape de l'inférence : médiane et p95
+Trois mesures, sur le vrai modèle :
+- chronométrage de l'inférence, de l'état initial à l'état optimisé, pas à pas.
+- cProfile de requêtes complètes (TestClient) sur l'API actuelle
 
 Le journal des appels est écrit dans un SQLite temporaire, rien n'est envoyé en base.
 Le profil cProfile est sauvegardé dans `data/profil_predict.prof`, pour l'explorer avec snakeviz.
@@ -38,20 +38,66 @@ REPETITIONS = 200
 LIGNES_PROFIL = 25
 FICHIER_PROFIL = Path("data/profil_predict.prof")
 
+# Clients d'entraînement et leur score par le modèle MLflow (voir scripts/exporter_modele.py)
+FICHIER_REFERENCE = Path("monitoring/reference.parquet")
+
+# Variantes d'inférence, de l'état initial à l'état optimisé, pas à pas
+# (libellé, threads LightGBM, entrée du modèle, appel du modèle)
+VARIANTES = [
+    ("Initial (DataFrame + MLflow)", -1, "dataframe", lambda X: main.modele.predict(X)),
+    ("+ retrait validation MLflow", -1, "dataframe", lambda X: main.pipeline.predict_proba(X)),
+    ("+ passage en numpy", -1, "numpy", lambda X: main.pipeline.predict_proba(X)),
+    ("+ un seul thread", 1, "numpy", lambda X: main.pipeline.predict_proba(X)),
+]
+
 # --- FONCTIONS ----------------------------------
-def chronometrer(fonction, repetitions: int = REPETITIONS) -> str:
-    """Médiane et p95 du temps d'exécution d'une fonction, en ms, après une chauffe."""
+def chronometrer(fonction, *arguments) -> tuple[float, float]:
+    """Médiane et p95 du temps d'exécution de `fonction(*arguments)`, en ms, après une chauffe."""
     for _ in range(CHAUFFE):
-        fonction()
+        fonction(*arguments)
     durees = []
-    for _ in range(repetitions):
+    for _ in range(REPETITIONS):
         debut = time.perf_counter()
-        fonction()
+        fonction(*arguments)
         durees.append((time.perf_counter() - debut) * 1000)
-    return f"médiane {np.median(durees):7.2f} ms   p95 {np.percentile(durees, 95):7.2f} ms"
+    return float(np.median(durees)), float(np.percentile(durees, 95))
+
+def entree_modele(features: dict, format_entree: str):
+    """Entrée du modèle construite comme dans l'API : DataFrame (avant) ou ligne numpy (après)."""
+    if format_entree == "dataframe":
+        return pd.DataFrame([features]).reindex(columns=main.colonnes).astype(float)
+    return np.array([[features.get(nom) for nom in main.colonnes]], dtype=float)
+
+def inferer(predire, features: dict, format_entree: str):
+    """Préparation de l'entrée puis appel du modèle : ce que la route fait pour scorer un client."""
+    return predire(entree_modele(features, format_entree))
+
+def regler_threads(n_jobs: int) -> None:
+    """Nombre de threads de LightGBM (-1 : tous les coeurs), partagé par MLflow et le pipeline."""
+    main.pipeline[-1].set_params(n_jobs=n_jobs)
+
+def chronometrer_variantes(features: dict) -> None:
+    """Temps de préparation de l'entrée + inférence, pour chaque variante, et gain par rapport à l'état initial."""
+    print(f"\n=== Inférence (entrée + modèle) : {REPETITIONS} répétitions ===")
+    print(f"{'':28} {'médiane':>9} {'p95':>9} {'gain':>6}")
+    reference = None
+    for libelle, n_jobs, format_entree, predire in VARIANTES:
+        regler_threads(n_jobs)
+        mediane, p95 = chronometrer(inferer, predire, features, format_entree)
+        reference = reference or mediane
+        print(f"{libelle:28} {mediane:6.2f} ms {p95:6.2f} ms {reference / mediane:5.1f}x")
+    # Plancher : le booster LightGBM seul, sur une entrée déjà convertie en float32 par le pipeline
+    booster = main.pipeline[-1].booster_
+    X_cast = main.pipeline[:-1].transform(entree_modele(features, "numpy"))
+    mediane, p95 = chronometrer(booster.predict, X_cast)
+    print(f"{'(booster LightGBM seul)':28} {mediane:6.2f} ms {p95:6.2f} ms")
 
 def profiler_requetes(client: TestClient, corps: dict) -> None:
-    """cProfile de requêtes complètes à /predict, trié par temps cumulé."""
+    """Chronométrage et cProfile de requêtes complètes à /predict sur l'API actuelle."""
+    mediane, p95 = chronometrer(lambda: client.post("/predict", json=corps))
+    print(f"\n=== Requête complète (API actuelle, écriture du journal comprise) : {REPETITIONS} répétitions ===")
+    print(f"médiane {mediane:.2f} ms   p95 {p95:.2f} ms")
+
     profil = cProfile.Profile()
     profil.enable()
     for _ in range(REPETITIONS):
@@ -63,22 +109,6 @@ def profiler_requetes(client: TestClient, corps: dict) -> None:
     profil.dump_stats(FICHIER_PROFIL)
     print(f"Profil complet : {FICHIER_PROFIL}")
 
-def chronometrer_etapes(client: TestClient, corps: dict) -> None:
-    """Temps de la requête complète, puis de chaque étape de l'inférence telle que l'API la fait."""
-    features = corps["features"]
-    X = pd.DataFrame([features]).reindex(columns=main.colonnes).astype(float)
-    pipeline = main.modele.get_raw_model()
-    X_cast = pipeline[:-1].transform(X)
-    booster = pipeline[-1].booster_
-
-    print(f"\n=== Chronométrage : {REPETITIONS} répétitions ===")
-    print("requête complète      ", chronometrer(lambda: client.post("/predict", json=corps)))
-    print("validation du client  ", chronometrer(lambda: main.verif_client(features)))
-    print("DataFrame d'entrée    ", chronometrer(lambda: pd.DataFrame([features]).reindex(columns=main.colonnes).astype(float)))
-    print("modèle MLflow (pyfunc)", chronometrer(lambda: main.modele.predict(X)))
-    print("  pipeline sklearn    ", chronometrer(lambda: pipeline.predict_proba(X)))
-    print("  booster LightGBM    ", chronometrer(lambda: booster.predict(X_cast)))
-
 # --- MAIN ----------------------------------
 
 if __name__ == "__main__":
@@ -88,7 +118,9 @@ if __name__ == "__main__":
         with TestClient(main.app, headers={"Authorization": f"Bearer {JETON_PROFIL}"}) as client:
             corps = {"features": main.EXEMPLES["client_1"]["value"]["features"]}
             print(f"Client d'exemple 1 : {len(corps['features'])} variables renseignées sur {len(main.colonnes)}")
-            chronometrer_etapes(client, corps)
+            chronometrer_variantes(corps["features"])
+            # Réglage de l'API remis en place avant de profiler les requêtes
+            regler_threads(1)
             profiler_requetes(client, corps)
             # Libère le fichier SQLite avant la suppression du dossier temporaire (Windows)
             main.moteur.dispose()
