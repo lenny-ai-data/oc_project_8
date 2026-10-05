@@ -1918,6 +1918,7 @@ dependencies = [
 [package.dev-dependencies]
 dev = [
     { name = "httpx2" },
+    { name = "pyarrow" },
     { name = "pytest" },
     { name = "pytest-cov" },
     { name = "ruff" },
@@ -1930,7 +1931,6 @@ monitoring = [
 ]
 optimisation = [
     { name = "onnxmltools" },
-    { name = "pyarrow" },
     { name = "snakeviz" },
 ]
 
@@ -1951,6 +1951,7 @@ requires-dist = [
 [package.metadata.requires-dev]
 dev = [
     { name = "httpx2", specifier = ">=2.13.1" },
+    { name = "pyarrow", specifier = ">=25.0.1" },
     { name = "pytest", specifier = ">=9.1.1" },
     { name = "pytest-cov", specifier = ">=7.1.0" },
     { name = "ruff", specifier = ">=0.16.9" },
@@ -1963,7 +1964,6 @@ monitoring = [
 ]
 optimisation = [
     { name = "onnxmltools", specifier = ">=1.16.0" },
-    { name = "pyarrow", specifier = ">=25.0.1" },
     { name = "snakeviz", specifier = ">=2.2.2" },
 ]
 

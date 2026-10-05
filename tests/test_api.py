@@ -6,7 +6,9 @@ Usage : uv run pytest   (couverture de api/ affichée)
 # --- IMPORT MODULES ----------------------------------
 
 import json
+from pathlib import Path
 
+import numpy as np
 import pandas as pd
 import pytest
 from fastapi.testclient import TestClient
@@ -28,6 +30,13 @@ CAS_422 = {
     "hors plage": (lambda f: f | {main.obligatoires[0]: main.bornes[main.obligatoires[0]][1] + 1}, "hors_plage"),
     "texte": (lambda f: f | {main.obligatoires[0]: "12"}, None),
 }
+
+# Non-régression : 10 000 clients d'entraînement et leur score par le modèle MLflow exporté de P6
+FICHIER_REFERENCE = Path("monitoring/reference.parquet")
+# Écart toléré avec ONNX (seuils des arbres en float32) : 1,4e-3 mesuré au maximum
+ECART_MAX = 5e-3
+# Part tolérée de décisions inversées par cette approximation : 0,1 % (aucune mesurée sur 10 000 clients)
+TAUX_DECISIONS_MAX = 1e-3
 
 # --- FIXTURES ----------------------------------
 
@@ -86,6 +95,18 @@ def test_predict_exemples(api, numero):
     # à la précision du float32 près (seuils des arbres en float32 dans le graphe ONNX)
     X = pd.DataFrame([features]).reindex(columns=main.colonnes).astype(float)
     assert lignes_journal()[-1]["score"] == pytest.approx(main.modele.predict(X)[0, 1], abs=1e-6)
+
+def test_non_regression_reference(api):
+    # Modèle servi (ONNX) contre score du modèle MLflow exporté, sur les 10 000 clients de la référence.
+    # Appel direct de la session, en un lot : 10 000 requêtes seraient trop longues, la route est couverte au-dessus
+    reference = pd.read_parquet(FICHIER_REFERENCE)
+    X = reference[main.colonnes].to_numpy(dtype=np.float32)
+    scores = main.session.run([main.SORTIE_ONNX], {main.ENTREE_ONNX: X})[0][:, 1]
+    attendus = reference["score"].to_numpy()
+    assert np.abs(scores - attendus).max() < ECART_MAX
+    # Décisions d'octroi au seuil métier : un client tout près du seuil peut basculer, mais rarement
+    seuil = main.metadonnees["seuil"]
+    assert ((scores >= seuil) != (attendus >= seuil)).mean() <= TAUX_DECISIONS_MAX
 
 def test_jeton_requis(api, monkeypatch):
     avant = len(lignes_journal())

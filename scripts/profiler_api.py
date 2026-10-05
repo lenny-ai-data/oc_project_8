@@ -1,17 +1,17 @@
 """Profile la route /predict de l'API et trace les gains de l'optimisation
 
-Trois mesures, sur le vrai modèle :
+Deux mesures, sur le vrai modèle :
 - chronométrage de l'inférence, de l'état initial à l'état optimisé, pas à pas, jusqu'à ONNX Runtime
-- précision d'ONNX Runtime (calcul en float32) sur les 10 000 clients de la référence du monitoring
 - cProfile de requêtes complètes (TestClient) sur l'API actuelle
 
 L'API sert le graphe ONNX (`model/model.onnx`) ; les variantes précédentes appellent le modèle MLflow
-et son pipeline sklearn, toujours chargés par l'API.
+et son pipeline sklearn, toujours chargés par l'API. La non-régression des scores est vérifiée par les tests
+(`test_non_regression_reference`).
 Le journal des appels est écrit dans un SQLite temporaire, rien n'est envoyé en base.
 Le profil cProfile est sauvegardé dans `data/profil_predict.prof`, pour l'explorer avec snakeviz.
 
-A lancer depuis la racine du projet (groupe optimisation : pyarrow pour la référence, snakeviz) :
-    uv run --group optimisation python -m scripts.profiler_api
+A lancer depuis la racine du projet (snakeviz dans le groupe optimisation) :
+    uv run python -m scripts.profiler_api
     uv run --group optimisation snakeviz data/profil_predict.prof
 """
 
@@ -40,12 +40,6 @@ REPETITIONS = 200
 # Nombre de fonctions affichées par cProfile, et profil complet sauvegardé pour snakeviz
 LIGNES_PROFIL = 25
 FICHIER_PROFIL = Path("data/profil_predict.prof")
-
-# Clients d'entraînement et leur score par le modèle MLflow (voir scripts/exporter_modele.py)
-FICHIER_REFERENCE = Path("monitoring/reference.parquet")
-
-# Écart de score au-delà duquel un client est compté comme mal reproduit par ONNX
-ECART_NOTABLE = 1e-4
 
 # Variantes d'inférence, de l'état initial à l'état optimisé, pas à pas
 # (libellé, threads LightGBM, entrée du modèle, appel du modèle)
@@ -102,19 +96,6 @@ def chronometrer_variantes(features: dict) -> None:
     mediane, p95 = chronometrer(booster.predict, entree_modele(features, "float32"))
     print(f"{'(booster LightGBM seul)':28} {mediane:6.2f} ms {p95:6.2f} ms")
 
-def comparer_precision_onnx() -> None:
-    """Écart de score entre ONNX Runtime (servi par l'API) et le pipeline sklearn, sur les clients de la référence."""
-    X = pd.read_parquet(FICHIER_REFERENCE)[main.colonnes].to_numpy(dtype=float)
-    sklearn = pipeline_sklearn().predict_proba(X)[:, 1]
-    onnx = main.session.run([main.SORTIE_ONNX], {main.ENTREE_ONNX: X.astype(np.float32)})[0][:, 1]
-    ecarts = np.abs(onnx - sklearn)
-    seuil = main.metadonnees["seuil"]
-    print(f"\n=== Précision d'ONNX Runtime : {len(X)} clients de la référence ===")
-    print(f"écart de score : médiane {np.median(ecarts):.1e}, p99 {np.percentile(ecarts, 99):.1e}, max {ecarts.max():.1e}")
-    print(f"clients à plus de {ECART_NOTABLE:.0e} : {int((ecarts > ECART_NOTABLE).sum())}")
-    print(f"décisions changées au seuil {seuil:.3f} : {int(((sklearn >= seuil) != (onnx >= seuil)).sum())}")
-    print(f"clients à moins de {ecarts.max():.1e} du seuil (décision fragile) : {int((np.abs(sklearn - seuil) < ecarts.max()).sum())}")
-
 def profiler_requetes(client: TestClient, corps: dict) -> None:
     """Chronométrage et cProfile de requêtes complètes à /predict sur l'API actuelle."""
     mediane, p95 = chronometrer(lambda: client.post("/predict", json=corps))
@@ -142,7 +123,6 @@ if __name__ == "__main__":
             corps = {"features": main.EXEMPLES["client_1"]["value"]["features"]}
             print(f"Client d'exemple 1 : {len(corps['features'])} variables renseignées sur {len(main.colonnes)}")
             chronometrer_variantes(corps["features"])
-            comparer_precision_onnx()
             profiler_requetes(client, corps)
             # Libère le fichier SQLite avant la suppression du dossier temporaire (Windows)
             main.moteur.dispose()

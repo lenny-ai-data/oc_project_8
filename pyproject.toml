@@ -35,6 +35,7 @@ addopts = "--cov=api --cov-report=term-missing"
 [dependency-groups]
 dev = [
     "httpx2>=2.13.1",
+    "pyarrow>=25.0.1",
     "pytest>=9.1.1",
     "pytest-cov>=7.1.0",
     "ruff>=0.16.9",
@@ -47,6 +48,5 @@ monitoring = [
 ]
 optimisation = [
     "onnxmltools>=1.16.0",
-    "pyarrow>=25.0.1",
     "snakeviz>=2.2.2",
 ]
