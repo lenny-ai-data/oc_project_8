@@ -16,7 +16,7 @@ from pathlib import Path
 from typing import Annotated
 
 import mlflow
-import pandas as pd
+import numpy as np
 from fastapi import Body, Depends, FastAPI, HTTPException, Request, Response
 from fastapi.security import HTTPAuthorizationCredentials, HTTPBearer
 from pydantic import BaseModel, Field, StrictFloat
@@ -42,6 +42,7 @@ JETON = os.getenv("API_TOKEN")
 # --- INITIALISATION ----------------------------------
 
 modele = None
+pipeline = None
 colonnes: list[str] = []
 obligatoires: list[str] = []
 bornes: dict[str, list[float]] = {}
@@ -183,10 +184,14 @@ async def lifespan(app: FastAPI):
 
     Un modèle absent ne fait pas échouer le démarrage : les routes répondent 503 avec la cause
     """
-    global modele, colonnes, obligatoires, bornes, metadonnees, en_ligne_depuis, erreur_demarrage, moteur
+    global modele, pipeline, colonnes, obligatoires, bornes, metadonnees, en_ligne_depuis, erreur_demarrage, moteur
     moteur = journal.preparer()
     try:
         modele = mlflow.pyfunc.load_model(str(DOSSIER_MODELE))
+        # On appelle directement le pipeline sklearn sous-jacent pour éviter la validation de schéma de MLflow (réalisée via Pydantic)
+        pipeline = modele.get_raw_model()
+        # Un seul thread pour ne pas surcharger le CPU partagé de Render
+        pipeline[-1].set_params(n_jobs=1)
         schema = modele.metadata.get_input_schema()
         colonnes = schema.input_names()
         obligatoires = schema.required_input_names()
@@ -289,9 +294,10 @@ def predict(client: Annotated[Client, Body(openapi_examples=EXEMPLES)], request:
     verif_modele()
     verif_client(client.features)
     # Colonnes dans l'ordre du modèle, variables non fournies à NaN
-    X = pd.DataFrame([client.features]).reindex(columns=colonnes).astype(float)
+    X = np.array([[client.features.get(nom) for nom in colonnes]], dtype=float)
     debut = time.perf_counter()
-    score = float(modele.predict(X)[0, 1])
+    # Inférence via le pipeline directement
+    score = float(pipeline.predict_proba(X)[0, 1])
     temps_inference_ms = (time.perf_counter() - debut) * 1000
     seuil = metadonnees["seuil"]
     decision = "NOK" if score >= seuil else "OK"

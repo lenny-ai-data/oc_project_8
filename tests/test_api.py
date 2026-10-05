@@ -5,6 +5,7 @@ Usage : uv run pytest   (couverture de api/ affichée)
 
 # --- IMPORT MODULES ----------------------------------
 
+import pandas as pd
 import pytest
 from fastapi.testclient import TestClient
 from sqlalchemy import create_engine, select
@@ -70,7 +71,8 @@ def test_health_et_metadata(api):
 
 @pytest.mark.parametrize("numero", range(1, len(main.EXEMPLES) + 1))
 def test_predict_exemples(api, numero):
-    reponse = api.post("/predict", json={"features": features_valides(numero)})
+    features = features_valides(numero)
+    reponse = api.post("/predict", json={"features": features})
     assert reponse.status_code == 200
     corps = reponse.json()
     assert 0 <= corps["score"] <= 1
@@ -78,6 +80,9 @@ def test_predict_exemples(api, numero):
     assert corps["decision"] == ("NOK" if corps["score"] >= corps["seuil"] else "OK")
     assert corps["seuil"] == pytest.approx(main.metadonnees["seuil"], abs=1e-3)
     assert corps["version_modele"] == main.metadonnees["version"]
+    # Non-régression de l'optimisation : score non arrondi (journal) identique à celui du modèle MLflow complet
+    X = pd.DataFrame([features]).reindex(columns=main.colonnes).astype(float)
+    assert lignes_journal()[-1]["score"] == main.modele.predict(X)[0, 1]
 
 def test_jeton_requis(api, monkeypatch):
     avant = len(lignes_journal())
@@ -156,7 +161,7 @@ def test_panne_imprevue_journalisee(api, monkeypatch):
     def modele_casse(_):
         raise RuntimeError("modèle cassé")
 
-    monkeypatch.setattr(main.modele, "predict", modele_casse)
+    monkeypatch.setattr(main.pipeline, "predict_proba", modele_casse)
     assert api.post("/predict", json={"features": features_valides()}).status_code == 500
     ligne = lignes_journal()[-1]
     assert ligne["statut_http"] == 500
@@ -195,6 +200,7 @@ def test_modele_indisponible(api, monkeypatch):
 def test_demarrage_sans_fichiers_du_modele_ni_base(tmp_path, monkeypatch):
     # Le démarrage n'échoue pas : l'erreur est gardée et les routes répondent 503
     monkeypatch.setattr(main, "modele", main.modele)
+    monkeypatch.setattr(main, "pipeline", main.pipeline)
     monkeypatch.setattr(main, "moteur", main.moteur)
     monkeypatch.setattr(main, "erreur_demarrage", None)
     # Base injoignable (dossier absent) : la création de la table échoue sans bloquer le démarrage
