@@ -1,14 +1,16 @@
 """Profile la route /predict de l'API et trace les gains de l'optimisation
 
 Trois mesures, sur le vrai modèle :
-- chronométrage de l'inférence, de l'état initial à l'état optimisé, pas à pas.
+- chronométrage de l'inférence, de l'état initial à l'état optimisé, pas à pas, puis avec ONNX Runtime
+- précision d'ONNX Runtime (calcul en float32) sur les 10 000 clients de la référence du monitoring
 - cProfile de requêtes complètes (TestClient) sur l'API actuelle
 
+ONNX Runtime est mesuré mais non déployé : l'API sert le modèle MLflow.
 Le journal des appels est écrit dans un SQLite temporaire, rien n'est envoyé en base.
 Le profil cProfile est sauvegardé dans `data/profil_predict.prof`, pour l'explorer avec snakeviz.
 
-A lancer depuis la racine du projet :
-    uv run python -m scripts.profiler_api
+A lancer depuis la racine du projet (groupe optimisation) :
+    uv run --group optimisation python -m scripts.profiler_api
     uv run --group optimisation snakeviz data/profil_predict.prof
 """
 
@@ -21,8 +23,11 @@ import time
 from pathlib import Path
 
 import numpy as np
+import onnxruntime as ort
 import pandas as pd
 from fastapi.testclient import TestClient
+from onnxmltools import convert_lightgbm
+from onnxmltools.convert.common.data_types import FloatTensorType
 
 from api import main
 
@@ -40,6 +45,12 @@ FICHIER_PROFIL = Path("data/profil_predict.prof")
 
 # Clients d'entraînement et leur score par le modèle MLflow (voir scripts/exporter_modele.py)
 FICHIER_REFERENCE = Path("monitoring/reference.parquet")
+
+# ONNX : seule la sortie des probabilités est demandée (la sortie "label" déclenche un avertissement de forme)
+SORTIE_ONNX = ["probabilities"]
+
+# Écart de score au-delà duquel un client est compté comme mal reproduit par ONNX
+ECART_NOTABLE = 1e-4
 
 # Variantes d'inférence, de l'état initial à l'état optimisé, pas à pas
 # (libellé, threads LightGBM, entrée du modèle, appel du modèle)
@@ -76,7 +87,19 @@ def regler_threads(n_jobs: int) -> None:
     """Nombre de threads de LightGBM (-1 : tous les coeurs), partagé par MLflow et le pipeline."""
     main.pipeline[-1].set_params(n_jobs=n_jobs)
 
-def chronometrer_variantes(features: dict) -> None:
+def convertir_onnx() -> ort.InferenceSession:
+    """Classifieur LightGBM converti en ONNX, servi par ONNX Runtime sur un seul thread (comme l'API).
+
+    L'étape de cast float32 du pipeline est remplacée par l'entrée float32 du graphe ONNX.
+    """
+    graphe = convert_lightgbm(
+        main.pipeline[-1], initial_types=[("X", FloatTensorType([None, len(main.colonnes)]))], zipmap=False
+    )
+    options = ort.SessionOptions()
+    options.intra_op_num_threads = 1
+    return ort.InferenceSession(graphe.SerializeToString(), options, providers=["CPUExecutionProvider"])
+
+def chronometrer_variantes(features: dict, session: ort.InferenceSession) -> None:
     """Temps de préparation de l'entrée + inférence, pour chaque variante, et gain par rapport à l'état initial."""
     print(f"\n=== Inférence (entrée + modèle) : {REPETITIONS} répétitions ===")
     print(f"{'':28} {'médiane':>9} {'p95':>9} {'gain':>6}")
@@ -86,11 +109,27 @@ def chronometrer_variantes(features: dict) -> None:
         mediane, p95 = chronometrer(inferer, predire, features, format_entree)
         reference = reference or mediane
         print(f"{libelle:28} {mediane:6.2f} ms {p95:6.2f} ms {reference / mediane:5.1f}x")
+    # ONNX Runtime, mesuré mais non déployé : même ligne numpy, convertie en float32
+    mediane, p95 = chronometrer(inferer, lambda X: session.run(SORTIE_ONNX, {"X": X.astype(np.float32)}), features, "numpy")
+    print(f"{'(ONNX Runtime, non déployé)':28} {mediane:6.2f} ms {p95:6.2f} ms {reference / mediane:5.1f}x")
     # Plancher : le booster LightGBM seul, sur une entrée déjà convertie en float32 par le pipeline
     booster = main.pipeline[-1].booster_
     X_cast = main.pipeline[:-1].transform(entree_modele(features, "numpy"))
     mediane, p95 = chronometrer(booster.predict, X_cast)
     print(f"{'(booster LightGBM seul)':28} {mediane:6.2f} ms {p95:6.2f} ms")
+
+def comparer_precision_onnx(session: ort.InferenceSession) -> None:
+    """Écart de score entre ONNX Runtime (float32) et le pipeline servi par l'API, sur les clients de la référence."""
+    X = pd.read_parquet(FICHIER_REFERENCE)[main.colonnes].to_numpy(dtype=float)
+    api = main.pipeline.predict_proba(X)[:, 1]
+    onnx = session.run(SORTIE_ONNX, {"X": X.astype(np.float32)})[0][:, 1]
+    ecarts = np.abs(onnx - api)
+    seuil = main.metadonnees["seuil"]
+    print(f"\n=== Précision d'ONNX Runtime : {len(X)} clients de la référence ===")
+    print(f"écart de score : médiane {np.median(ecarts):.1e}, p99 {np.percentile(ecarts, 99):.1e}, max {ecarts.max():.1e}")
+    print(f"clients à plus de {ECART_NOTABLE:.0e} : {int((ecarts > ECART_NOTABLE).sum())}")
+    print(f"décisions changées au seuil {seuil:.3f} : {int(((api >= seuil) != (onnx >= seuil)).sum())}")
+    print(f"clients à moins de {ecarts.max():.1e} du seuil (décision fragile) : {int((np.abs(api - seuil) < ecarts.max()).sum())}")
 
 def profiler_requetes(client: TestClient, corps: dict) -> None:
     """Chronométrage et cProfile de requêtes complètes à /predict sur l'API actuelle."""
@@ -118,9 +157,11 @@ if __name__ == "__main__":
         with TestClient(main.app, headers={"Authorization": f"Bearer {JETON_PROFIL}"}) as client:
             corps = {"features": main.EXEMPLES["client_1"]["value"]["features"]}
             print(f"Client d'exemple 1 : {len(corps['features'])} variables renseignées sur {len(main.colonnes)}")
-            chronometrer_variantes(corps["features"])
-            # Réglage de l'API remis en place avant de profiler les requêtes
+            session = convertir_onnx()
+            chronometrer_variantes(corps["features"], session)
+            # Réglage de l'API remis en place avant la comparaison et le profilage des requêtes
             regler_threads(1)
+            comparer_precision_onnx(session)
             profiler_requetes(client, corps)
             # Libère le fichier SQLite avant la suppression du dossier temporaire (Windows)
             main.moteur.dispose()
