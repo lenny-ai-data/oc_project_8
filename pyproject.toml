@@ -43,3 +43,6 @@ monitoring = [
     "matplotlib>=3.11.2",
     "streamlit>=1.64.0",
 ]
+optimisation = [
+    "snakeviz>=2.2.2",
+]
