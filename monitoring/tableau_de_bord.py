@@ -112,6 +112,14 @@ if entrees.empty:
 # Barre latérale : réglages et source des données
 with st.sidebar:
     st.header("Réglages")
+    # Révision déployée (commit) : la plus récente par défaut, pour ne pas mélanger les versions de l'API.
+    # Appels sans révision : API lancée en local
+    revisions = lignes.groupby(lignes["revision"].fillna("locale"))["horodatage"].min().sort_values(ascending=False)
+    revision = st.selectbox("Révision de l'API", ["Toutes", *revisions.index], index=1 if len(revisions) else 0,
+                            format_func=lambda r: r if r == "Toutes" else f"{r[:7]} (depuis le {revisions[r]:%d/%m %H:%M})")
+    if revision != "Toutes":
+        lignes = lignes[lignes["revision"].fillna("locale") == revision]
+        entrees = entrees[entrees.index.isin(lignes.index)]
     taille = st.select_slider("Fenêtre (appels réussis)", TAILLES_FENETRE, value=FENETRE_DEFAUT)
     if st.button("Rafraîchir les données"):
         charger_journal.clear()
@@ -119,6 +127,12 @@ with st.sidebar:
     st.caption(f"Base : {'Supabase (Postgres)' if os.getenv('DATABASE_URL') else 'SQLite locale'}")
     st.caption(f"Appels journalisés : {len(lignes):,}".replace(",", " "))
     st.caption(f"Dernier appel : {lignes['horodatage'].max():%d/%m/%Y %H:%M} UTC")
+
+# Révision trop peu appelée : PSI sans valeur (voire incalculable si une colonne n'a aucune valeur)
+if len(entrees) < TAILLES_FENETRE[0]:
+    st.warning(f"{len(entrees)} appel(s) réussi(s) pour cette révision : trop peu pour l'analyse "
+               f"(minimum {TAILLES_FENETRE[0]}). Choisir une autre révision dans la barre latérale.")
+    st.stop()
 
 # Fenêtres disjointes d'appels réussis : la dernière est la fenêtre courante. 
 # On identifie aussi tous les appels reçus depuis son début (erreurs comprises)

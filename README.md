@@ -17,7 +17,7 @@ Le modèle cible du registry MLflow (`scoring-credit`, alias `champion`) est exp
 | Règle de décision | `score >= seuil` : crédit refusé (`NOK`), sinon accordé (`OK`) |
 | Seuil | optimisé pour un coût d'un faux négatif égal à 10 fois celui d'un faux positif |
 
-Le dossier `model/` contient le modèle MLflow (`MLmodel`, `model.skops`), sa conversion ONNX (`model.onnx`, utilisée pour l'inférence, voir [Optimisation des performances](#optimisation-des-performances)), `metadonnees.json` (version, run MLflow, seuil, performances) et `bornes.json` (min et max des variables sur le jeu d'entraînement, utilisés pour rejeter les valeurs aberrantes).
+Le dossier `model/` contient le modèle MLflow (`MLmodel`, `model.skops`), sa conversion ONNX (`model.onnx`, utilisée pour l'inférence, voir [Performances](#performances)), `metadonnees.json` (version, run MLflow, seuil, performances) et `bornes.json` (min et max des variables sur le jeu d'entraînement, utilisés pour rejeter les valeurs aberrantes).
 
 ## Arborescence
 
@@ -39,6 +39,7 @@ P8/
 │   └── test_api.py               # Tests de l'API
 ├── .github/workflows/ci-cd.yml   # Lint, tests, build de l'image, déploiement
 ├── Jacquinot_Lenny_6_notebook_drift_102026.ipynb  # Étude du suivi opérationnel et du drift
+├── ANALYSE.md                    # Résultats du monitoring et évolution des performances
 ├── .env.example                  # Modèle du fichier .env (variables d'environnement)
 ├── Dockerfile                    # Image Docker
 ├── .dockerignore
@@ -178,9 +179,9 @@ uv run --group monitoring python -m streamlit run monitoring/tableau_de_bord.py
 | Référence | `monitoring/reference.parquet` : 10 000 clients tirés du jeu d'entraînement, avec le score du modèle, écrit par `scripts/exporter_modele.py` |
 | Variables surveillées | les 20 variables les plus importantes du modèle (gain LightGBM) et le score |
 
-Les métriques portent sur la **fenêtre courante** : les 1 000 derniers appels réussis (réglable dans la barre latérale), et toutes les erreurs reçues sur la même période. Le journal est découpé en fenêtres disjointes en partant du plus récent : chaque fenêtre est un échantillon indépendant, ce qui permet de confirmer une alerte par la fenêtre précédente et de suivre le PSI dans le temps.
+Les métriques portent sur la **fenêtre courante** : les 1 000 derniers appels réussis (réglable dans la barre latérale), et toutes les erreurs reçues sur la même période. Le journal est découpé en fenêtres disjointes en partant du plus récent : chaque fenêtre est un échantillon indépendant, ce qui permet de confirmer une alerte par la fenêtre précédente et de suivre le PSI dans le temps. La fenêtre de 1 000 appels est le minimum fiable déterminé dans le notebook d'analyse.
 
-1 000 appels est le minimum fiable déterminé dans le notebook d'analyse.
+Par défaut, seuls les appels de la **révision la plus récente** de l'API (commit déployé) sont analysés, pour ne pas mélanger les versions successives. La barre latérale permet de choisir une révision antérieure, par exemple pour comparer les temps de réponse avant et après une optimisation, ou de tout afficher. Une révision de moins de 500 appels réussis n'est pas analysée.
 
 ### Lecture du tableau de bord
 
@@ -212,12 +213,12 @@ Environ 5 % des requêtes sont volontairement rendues invalides pour alimenter l
 
 ```bash
 # Depuis la racine, avec l'environnement de P6 (lecture du jeu de données) et le jeton de .env
-uv run --project ../P6 --env-file .env python -m scripts.simuler_trafic --url https://credit-scoring-swvm.onrender.com/ --appels 5000
+uv run --project ../P6 --env-file .env python -m scripts.simuler_trafic --url https://credit-scoring-swvm.onrender.com/ --appels 2500
 ```
 
 ## Interpréter le monitoring
 
-L'étude complète (choix des variables, du PSI et de la taille de fenêtre) est dans le notebook `Jacquinot_Lenny_6_notebook_drift_102026.ipynb`. Cette section résume comment lire les signaux et ce que la simulation a montré.
+L'étude complète (choix des variables, du PSI et de la taille de fenêtre) est dans le notebook `Jacquinot_Lenny_6_notebook_drift_102026.ipynb`. Cette section donne la grille de lecture des signaux ; les résultats obtenus sur le trafic simulé sont dans [ANALYSE.md](ANALYSE.md).
 
 ### Que faire face à un signal
 
@@ -226,30 +227,17 @@ L'étude complète (choix des variables, du PSI et de la taille de fenêtre) est
 | Taux d'erreur au-dessus de 5 à 6 % | les requêtes reçues ne respectent plus le contrat de l'API | lire les causes : `manquantes` ou `inconnues` → format des données en amont, `hors_plage` → population sortant des bornes d'entraînement |
 | Pannes serveur (5xx) | panne du modèle ou de l'API | logs Render et `/health`|
 | Latence p95 en hausse | serveur saturé ou ralenti | comparer latence globale et temps d'inférence pour identifier la source |
-| Taux de refus à plus de 5 points de la référence | la population a changé, ou le modèle juge différemment | ouvrir l'onglet Dérive pour trouver les variables en cause |
+| Taux de refus à plus de 5 points de la référence | la population a changé | ouvrir l'onglet Dérive pour trouver les variables en cause |
 | PSI en vigilance, **à confirmer** | pic possible sur une seule fenêtre, surtout pour une colonne peu renseignée | attendre la fenêtre suivante |
 | PSI en vigilance, **confirmée** | changement réel et durable de la population sur cette variable | analyse métier : nouveau canal, nouvelle offre, méthode de calcul des données |
 | PSI **critique** confirmé | changement important sur une variable influente | réévaluer le modèle dès que des défauts réels sont disponibles et envisager de recalibrer le seuil ou de réentraîner |
 
-### Résultats sur la simulation
-
-Deux phases de 4 500 appels (journal du 02/10/2026), comparées à la référence :
-
-- **Service stable** : aucune panne serveur, 5,3 à 5,7 % d'erreurs pour 5 % injectées. L'écart vient d'environ 0,6 % de clients réels refusés (variable obligatoire absente ou hors bornes).
-- **L'inférence est le goulot d'étranglement** : 87 % de la latence, avec environ 2 % d'appels autour de 1 s liés au processeur partagé de Render. Point de départ de l'[optimisation](#optimisation-des-performances), qui ramène la latence médiane de 113 à 7 ms.
-- **Phase stable sans fausse alerte** : PSI maximal de 0,019 sur les 21 colonnes, taux de refus de 28,1 % contre 28,5 % pour la référence.
-- **Phase de dérive détectée** : les deux variables déplacées par la simulation ressortent, `EXT_SOURCE_2` (PSI de 0,205) et `DAYS_BIRTH` (0,183). Le taux de refus gagne 8,3 points (36,8 %), le PSI du score reste à 0,061.
-- **Détection en 290 à 340 appels** après le début de la dérive, avec des fenêtres glissantes de 500 appels.
-- **Dans le tableau de bord** (fenêtre courante de 1 000 appels, en fin de phase de dérive) : `EXT_SOURCE_2` (0,213) et `DAYS_BIRTH` (0,165) sont en vigilance **confirmée**. `EXT_SOURCE_1` (0,101, renseignée à 46 %) est **à confirmer** : elle était à 0,089 sur la fenêtre précédente. Elle n'est pas visée par la simulation, mais elle est corrélée à l'âge.
-
 ### Points de vigilance
 
-- **Taille de fenêtre** : sous 1 000 appels, le bruit du PSI dépasse le seuil de 0,1. Une fenêtre plus grande est plus fiable mais réagit plus tard : une dérive récente n'y apparaît qu'une fois une bonne part de ses appels renouvelée.
+- **Taille de fenêtre** : sous 1 000 appels, le bruit du PSI dépasse le seuil de 0,1. Une fenêtre plus grande est plus fiable mais réagit plus tard.
 - **Colonnes peu renseignées** (`EXT_SOURCE_1`, `OWN_CAR_AGE`, `CC_CNT_DRAWINGS_ATM_CURRENT_MEAN`) portent les fausses alertes, d'où la confirmation sur deux fenêtres.
 - **Verdict global d'Evidently** (dérive si 50 % des colonnes dérivent) : il ne se déclenche pas pour une dérive concentrée sur 2 colonnes sur 21. Le tableau de bord évalue donc colonne par colonne.
-- **Dérive n'est pas performance** : sans les défauts réels, connus des mois plus tard, on détecte un changement de population, pas une dégradation du modèle. Le réentraînement se décide sur une dérive persistante **et** une performance mesurée en baisse.
-- **Simulation simple** : dérive franche et brutale, sur deux variables. Les dérives lentes, multivariées ou portant sur les valeurs manquantes ne sont pas testées.
-- **Seuils à calibrer** : l'écart de 5 points sur le taux de refus et le niveau critique de 0,25 sont des conventions, à ajuster sur du trafic réel.
+- **Dérive n'est pas performance** : sans les défauts réels, connus des mois plus tard, on détecte un changement de population, pas une dégradation du modèle. Le réentraînement se décide sur une dérive persistante et une performance mesurée en baisse.
 
 ### Suites possibles en production
 
@@ -257,78 +245,21 @@ Deux phases de 4 500 appels (journal du 02/10/2026), comparées à la référenc
 - **Calcul automatique** tous les 1 000 appels, ou une fois par jour si le trafic est faible, avec notification au lieu d'une consultation manuelle du tableau de bord.
 - **Performance réelle** : rapprocher les scores des défauts constatés quand ils sont connus (AUC, coût métier), seul moyen de savoir si le modèle se dégrade.
 
-## Optimisation des performances
+## Performances
 
-Le monitoring montrait sur Render une latence médiane de 113 ms, dont l'essentiel en inférence, et environ 2 % d'appels vers 1 s. Objectif : réduire le temps d'inférence et de réponse sans changer les décisions du modèle.
+L'inférence passe par **ONNX Runtime**, sur un seul thread : environ 7 ms de latence médiane sur Render, contre 113 ms pour la première version. La démarche (profiling, goulots, gains mesurés à chaque étape, précision) est retracée dans [ANALYSE.md](ANALYSE.md).
 
-### Méthode
-
-`scripts/profiler_api.py` mesure la route `/predict` sur le vrai modèle, en local :
-
-- **chronométrage pas à pas** : préparation de l'entrée et inférence, en ajoutant une optimisation à la fois (médiane et p95 sur 200 répétitions, après une chauffe) ;
-- **cProfile** de 200 requêtes complètes via le `TestClient` : seul le chemin d'une requête est profilé, pas le démarrage (imports, chargement du modèle), payé une seule fois.
+- **Modèle servi** : `model/model.onnx`, conversion du classifieur LightGBM. Le modèle MLflow reste chargé pour sa signature (variables, obligatoires) et la traçabilité jusqu'au registry.
+- **Synchronisation** : `model.onnx` est produit par le même export que le modèle MLflow et porte la version du registry et le run. S'ils diffèrent de `metadonnees.json`, l'API ne sert aucun score : ses routes répondent 503 avec la cause.
+- **Précision** : ONNX stocke les seuils des arbres en float32, d'où un écart de score d'au plus 1,4·10⁻³ sur les 10 000 clients de la référence, sans décision changée. `test_non_regression_reference` borne cet écart en CI (5·10⁻³, au plus 0,1 % de décisions inversées).
 
 ```bash
+# Profiling de /predict en local : chronométrage pas à pas et cProfile
 uv run python -m scripts.profiler_api
+
 # Exploration graphique du profil (groupe optimisation)
 uv run --group optimisation snakeviz data/profil_predict.prof
 ```
-
-En production, les versions sont comparées dans le journal des appels grâce à la colonne `revision`, sur une simulation de 1 000 appels envoyant les mêmes clients à chaque version.
-
-### Goulots identifiés
-
-1. **La validation de schéma de MLflow** (`_enforce_schema`) : environ 75 % du temps d'une requête sous cProfile. `pyfunc.predict` contrôle les 527 colonnes une par une et reconstruit un DataFrame, en doublon de la validation de l'API (Pydantic et `verif_client`).
-2. **Le DataFrame pandas d'une seule ligne** : 3 ms à construire, trois fois le temps du modèle lui-même, longtemps masqué par MLflow.
-3. **Les threads de LightGBM** (`n_jobs=-1`) : autant de threads que de cœurs de la machine hôte pour scorer une seule ligne, sur le processeur partagé de Render.
-
-Piège de mesure : chronométrer le modèle sur un même DataFrame réutilisé sous-estime son coût de moitié, car pandas garde en cache les colonnes déjà extraites. Le script reconstruit donc l'entrée à chaque répétition, comme la route.
-
-### Optimisations et gains
-
-En local, préparation de l'entrée et inférence (médiane) :
-
-| Optimisation (cumulée) | Médiane | Gain |
-|---|---|---|
-| Initial : DataFrame et `pyfunc.predict` | 21,3 ms | 1× |
-| Pipeline sklearn appelé directement, sans la validation MLflow | 5,8 ms | 3,6× |
-| Entrée en ligne numpy plutôt qu'en DataFrame | 0,96 ms | 22× |
-| LightGBM sur un seul thread | 0,65 ms | 33× |
-| Classifieur converti en ONNX, servi par ONNX Runtime | 0,07 ms | ≈ 300× |
-
-Sur Render, appels réussis de la simulation :
-
-| | Initial | Code optimisé | ONNX (déployé) |
-|---|---|---|---|
-| Latence médiane | 113 ms | 8,3 ms | 7,2 ms |
-| Latence p95 | 209 ms | 11,8 ms | 10,4 ms |
-| Latence p99 | 1 047 ms | 17,7 ms | 24,1 ms |
-| Inférence médiane | 97 ms | 1,6 ms | 0,33 ms |
-| Appels au-delà de 500 ms | 2,4 % | 0,1 % | 0,1 % |
-| Part de l'inférence dans le temps total | 81 % | 17 % | 5 % |
-
-*Initial : 8 504 appels du 02/10. Code optimisé : moyenne de deux simulations, qui ne diffèrent que de 0,2 ms en médiane. ONNX : une simulation.*
-
-- **Le gain est plus fort sur Render qu'en local** (inférence divisée par 60 contre 33) : le processeur partagé amplifie le coût de la validation MLflow, de pandas et des threads. Les appels vers 1 s disparaissent aussi ; le passage à un seul thread en est la cause la plus probable, sans mesure isolée (les trois optimisations du code ont été déployées ensemble).
-- **ONNX ajoute environ 1 ms** (13 % de la latence) : un gain résiduel après l'optimisation du code, mais mesurable. Son p99 plus élevé n'est pas significatif : il se joue sur une dizaine d'appels.
-
-### Précision : pas de régression
-
-- **Code optimisé** : scores identiques au modèle MLflow (écart nul sur les 10 000 clients de la référence), le pipeline gardant sa conversion en float32.
-- **ONNX** : le convertisseur stocke les seuils des arbres en float32, contre float64 dans LightGBM. Un client dont une variable tombe sur un seuil arrondi change de branche. Écart de score médian de 6·10⁻⁸, maximal de 1,4·10⁻³ (2 clients sur 10 000 au-delà de 10⁻⁴), et aucune décision changée au seuil métier. 89 clients sont cependant à moins de 1,4·10⁻³ du seuil : sur une population plus large, une décision peut basculer.
-- **Tests** : `test_non_regression_reference` compare le modèle servi au score du modèle MLflow exporté, sur les 10 000 clients. Il accepte cette approximation dans des limites fixées : écart sous 5·10⁻³ et au plus 0,1 % de décisions inversées. Rejoué en CI, il bloque un réexport ou une mise à jour d'ONNX qui dégraderait les scores. Les 5 exemples sont aussi vérifiés à travers la route, à 10⁻⁶ près.
-
-### Configuration finale
-
-- **Inférence par ONNX Runtime sur un seul thread**. Le modèle MLflow reste chargé pour sa signature (variables, obligatoires) et la traçabilité jusqu'au registry.
-- **`model.onnx` produit par le même export que le modèle MLflow** (`scripts/exporter_modele.py`) et marqué de la version du registry et du run : l'API refuse de démarrer (503) s'ils diffèrent de `metadonnees.json`.
-- **ONNX conservé malgré un gain résiduel** : c'est la version la plus rapide, et son approximation est mesurée, bornée par les tests et sans effet observé sur les décisions. Contreparties : les scores ne sont plus exactement ceux du modèle validé en P6, et onnxruntime s'ajoute à l'image.
-
-### Limites et pistes
-
-- **Le goulot est désormais hors du modèle** : environ 7 ms par requête sur Render pour la validation Pydantic des 527 champs, `verif_client` et le middleware, qui relit le corps JSON pour le journal.
-- **Pauses isolées d'environ 900 ms**, une par simulation de 1 000 appels, avec une inférence normale : collecte complète du ramasse-miettes de Python, qui parcourt les quelque 280 000 objets chargés au démarrage (71 ms en local). Un `gc.freeze()` après le chargement la ramène sous la milliseconde en local ; non déployé.
-- **Scalabilité** : un seul processus uvicorn sur un processeur partagé (offre gratuite de Render). Pour plus de débit, plusieurs workers ou instances ; pour une latence stable, un processeur dédié (offre payante). Pour du scoring par lots, ONNX Runtime traite tout un lot de clients en un seul appel.
 
 ## Export du modèle depuis le registry
 
@@ -336,22 +267,25 @@ Après avoir promu un nouveau modèle (avec son registry et son jeu de données)
 
 ```bash
 # Réexporte le modèle, sa conversion ONNX, les métadonnées et les bornes dans model/, et la référence du monitoring
-# (environnement de P6 pour le registry, onnxmltools ajouté à la volée pour la conversion)
 uv run --project ../P6 --with onnxmltools python scripts/exporter_modele.py
 ```
-`model/model.onnx` porte la version du registry et le run MLflow du modèle dont il est issu : l'API refuse de démarrer (503) s'ils ne correspondent pas à `metadonnees.json`.
+`model/model.onnx` porte la version du registry et le run MLflow du modèle dont il est issu : s'ils ne correspondent pas à `metadonnees.json`, les routes de l'API répondent 503 avec la cause.
 Les versions de `scikit-learn`, `lightgbm`, `skops` et `pandas` sont figées dans `pyproject.toml` : le format `skops` est lié à la version de scikit-learn.
 
 ## Tests et CI/CD
 
 ```bash
-# Tests et couverture de api/ 
+# Tests
 uv run pytest
+
+# Avec rapport de couverture
+uv run pytest --cov-report=html:tests/htmlcov
+
 ```
 
 Les tests utilisent le vrai modèle versionné et un SQLite temporaire pour le journal, sans besoin de réseau ni secret. Ils couvrent les trois routes, les 5 exemples, la non-régression des scores sur les 10 000 clients de la référence, chaque cas d'erreur 422, le 503, le démarrage sans les fichiers du modèle ou avec un `model.onnx` désynchronisé, et le journal : une ligne par appel, erreurs et panne imprévue (500) tracées, base indisponible sans effet sur la réponse.
 
-À chaque push, `.github/workflows/ci-cd.yml` enchaîne trois jobs de CI, puis un 4ème de CD sur `main`, chacun bloquant le suivant :
+À chaque push, `.github/workflows/ci-cd.yml` lance trois jobs de CI en parallèle, puis un 4ème de CD sur `main`, qui ne démarre que si les trois sont passés :
 
 1. **qualité** : lint `ruff`
 2. **tests** : `pytest`, avec 90 % de couverture requis, rapport HTML publié en artefact
