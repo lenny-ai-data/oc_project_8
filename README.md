@@ -6,7 +6,7 @@ Stack : **FastAPI**, modèle **LightGBM** chargé via **MLflow** et servi par **
 
 > 🔌 API Render : https://credit-scoring-swvm.onrender.com/docs
 
-## Le modèle
+## Le modèle test
 
 Le modèle cible du registry MLflow (`scoring-credit`, alias `champion`) est exporté dans `model/` et versionné avec le code : le conteneur n'a pas accès au registry.
 
